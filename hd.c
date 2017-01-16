@@ -11,7 +11,14 @@
 #include <linux/slab.h>
 
 #include "greybus.h"
+#include "greybus_trace.h"
 
+EXPORT_TRACEPOINT_SYMBOL_GPL(gb_hd_create);
+EXPORT_TRACEPOINT_SYMBOL_GPL(gb_hd_release);
+EXPORT_TRACEPOINT_SYMBOL_GPL(gb_hd_add);
+EXPORT_TRACEPOINT_SYMBOL_GPL(gb_hd_del);
+EXPORT_TRACEPOINT_SYMBOL_GPL(gb_hd_in);
+EXPORT_TRACEPOINT_SYMBOL_GPL(gb_message_submit);
 
 static struct ida gb_hd_bus_id_map;
 
@@ -39,9 +46,69 @@ static struct attribute *bus_attrs[] = {
 };
 ATTRIBUTE_GROUPS(bus);
 
+int gb_hd_cport_reserve(struct gb_host_device *hd, u16 cport_id)
+{
+	struct ida *id_map = &hd->cport_id_map;
+	int ret;
+
+	ret = ida_simple_get(id_map, cport_id, cport_id + 1, GFP_KERNEL);
+	if (ret < 0) {
+		dev_err(&hd->dev, "failed to reserve cport %u\n", cport_id);
+		return ret;
+	}
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(gb_hd_cport_reserve);
+
+void gb_hd_cport_release_reserved(struct gb_host_device *hd, u16 cport_id)
+{
+	struct ida *id_map = &hd->cport_id_map;
+
+	ida_simple_remove(id_map, cport_id);
+}
+EXPORT_SYMBOL_GPL(gb_hd_cport_release_reserved);
+
+/* Locking: Caller guarantees serialisation */
+int gb_hd_cport_allocate(struct gb_host_device *hd, int cport_id,
+				unsigned long flags)
+{
+	struct ida *id_map = &hd->cport_id_map;
+	int ida_start, ida_end;
+
+	if (hd->driver->cport_allocate)
+		return hd->driver->cport_allocate(hd, cport_id, flags);
+
+	if (cport_id < 0) {
+		ida_start = 0;
+		ida_end = hd->num_cports;
+	} else if (cport_id < hd->num_cports) {
+		ida_start = cport_id;
+		ida_end = cport_id + 1;
+	} else {
+		dev_err(&hd->dev, "cport %d not available\n", cport_id);
+		return -EINVAL;
+	}
+
+	return ida_simple_get(id_map, ida_start, ida_end, GFP_KERNEL);
+}
+
+/* Locking: Caller guarantees serialisation */
+void gb_hd_cport_release(struct gb_host_device *hd, u16 cport_id)
+{
+	if (hd->driver->cport_release) {
+		hd->driver->cport_release(hd, cport_id);
+		return;
+	}
+
+	ida_simple_remove(&hd->cport_id_map, cport_id);
+}
+
 static void gb_hd_release(struct device *dev)
 {
 	struct gb_host_device *hd = to_gb_host_device(dev);
+
+	trace_gb_hd_release(hd);
 
 	if (hd->svc)
 		gb_svc_put(hd->svc);
@@ -118,6 +185,8 @@ struct gb_host_device *gb_hd_create(struct gb_hd_driver *driver,
 	device_initialize(&hd->dev);
 	dev_set_name(&hd->dev, "greybus%d", hd->bus_id);
 
+	trace_gb_hd_create(hd);
+
 	hd->svc = gb_svc_create(hd);
 	if (!hd->svc) {
 		dev_err(&hd->dev, "failed to create svc\n");
@@ -143,12 +212,16 @@ int gb_hd_add(struct gb_host_device *hd)
 		return ret;
 	}
 
+	trace_gb_hd_add(hd);
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(gb_hd_add);
 
 void gb_hd_del(struct gb_host_device *hd)
 {
+	trace_gb_hd_del(hd);
+
 	/*
 	 * Tear down the svc and flush any on-going hotplug processing before
 	 * removing the remaining interfaces.
@@ -158,6 +231,12 @@ void gb_hd_del(struct gb_host_device *hd)
 	device_del(&hd->dev);
 }
 EXPORT_SYMBOL_GPL(gb_hd_del);
+
+void gb_hd_shutdown(struct gb_host_device *hd)
+{
+	gb_svc_del(hd->svc);
+}
+EXPORT_SYMBOL_GPL(gb_hd_shutdown);
 
 void gb_hd_put(struct gb_host_device *hd)
 {

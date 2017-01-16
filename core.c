@@ -10,13 +10,10 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #define CREATE_TRACE_POINTS
-#include "bootrom.h"
 #include "greybus.h"
 #include "greybus_trace.h"
-#include "legacy.h"
 
-EXPORT_TRACEPOINT_SYMBOL_GPL(gb_host_device_send);
-EXPORT_TRACEPOINT_SYMBOL_GPL(gb_host_device_recv);
+#define GB_BUNDLE_AUTOSUSPEND_MS	3000
 
 /* Allow greybus to be disabled at boot if needed */
 static bool nogreybus;
@@ -31,22 +28,22 @@ int greybus_disabled(void)
 }
 EXPORT_SYMBOL_GPL(greybus_disabled);
 
-static int greybus_match_one_id(struct gb_bundle *bundle,
+static bool greybus_match_one_id(struct gb_bundle *bundle,
 				     const struct greybus_bundle_id *id)
 {
 	if ((id->match_flags & GREYBUS_ID_MATCH_VENDOR) &&
 	    (id->vendor != bundle->intf->vendor_id))
-		return 0;
+		return false;
 
 	if ((id->match_flags & GREYBUS_ID_MATCH_PRODUCT) &&
 	    (id->product != bundle->intf->product_id))
-		return 0;
+		return false;
 
 	if ((id->match_flags & GREYBUS_ID_MATCH_CLASS) &&
 	    (id->class != bundle->class))
-		return 0;
+		return false;
 
-	return 1;
+	return true;
 }
 
 static const struct greybus_bundle_id *
@@ -64,7 +61,7 @@ greybus_match_id(struct gb_bundle *bundle, const struct greybus_bundle_id *id)
 	return NULL;
 }
 
-static int greybus_module_match(struct device *dev, struct device_driver *drv)
+static int greybus_match_device(struct device *dev, struct device_driver *drv)
 {
 	struct greybus_driver *driver = to_greybus_driver(drv);
 	struct gb_bundle *bundle;
@@ -149,10 +146,21 @@ static int greybus_uevent(struct device *dev, struct kobj_uevent_env *env)
 	return 0;
 }
 
+static void greybus_shutdown(struct device *dev)
+{
+	if (is_gb_host_device(dev)) {
+		struct gb_host_device *hd;
+
+		hd = to_gb_host_device(dev);
+		gb_hd_shutdown(hd);
+	}
+}
+
 struct bus_type greybus_bus_type = {
 	.name =		"greybus",
-	.match =	greybus_module_match,
+	.match =	greybus_match_device,
 	.uevent =	greybus_uevent,
+	.shutdown =	greybus_shutdown,
 };
 
 static int greybus_probe(struct device *dev)
@@ -167,6 +175,31 @@ static int greybus_probe(struct device *dev)
 	if (!id)
 		return -ENODEV;
 
+	retval = pm_runtime_get_sync(&bundle->intf->dev);
+	if (retval < 0) {
+		pm_runtime_put_noidle(&bundle->intf->dev);
+		return retval;
+	}
+
+	retval = gb_control_bundle_activate(bundle->intf->control, bundle->id);
+	if (retval) {
+		pm_runtime_put(&bundle->intf->dev);
+		return retval;
+	}
+
+	/*
+	 * Unbound bundle devices are always deactivated. During probe, the
+	 * Runtime PM is set to enabled and active and the usage count is
+	 * incremented. If the driver supports runtime PM, it should call
+	 * pm_runtime_put() in its probe routine and pm_runtime_get_sync()
+	 * in remove routine.
+	 */
+	pm_runtime_set_autosuspend_delay(dev, GB_BUNDLE_AUTOSUSPEND_MS);
+	pm_runtime_use_autosuspend(dev);
+	pm_runtime_get_noresume(dev);
+	pm_runtime_set_active(dev);
+	pm_runtime_enable(dev);
+
 	retval = driver->probe(bundle, id);
 	if (retval) {
 		/*
@@ -174,8 +207,20 @@ static int greybus_probe(struct device *dev)
 		 */
 		WARN_ON(!list_empty(&bundle->connections));
 
+		gb_control_bundle_deactivate(bundle->intf->control, bundle->id);
+
+		pm_runtime_disable(dev);
+		pm_runtime_set_suspended(dev);
+		pm_runtime_put_noidle(dev);
+		pm_runtime_dont_use_autosuspend(dev);
+		pm_runtime_put(&bundle->intf->dev);
+
 		return retval;
 	}
+
+	gb_timesync_schedule_synchronous(bundle->intf);
+
+	pm_runtime_put(&bundle->intf->dev);
 
 	return 0;
 }
@@ -185,10 +230,23 @@ static int greybus_remove(struct device *dev)
 	struct greybus_driver *driver = to_greybus_driver(dev->driver);
 	struct gb_bundle *bundle = to_gb_bundle(dev);
 	struct gb_connection *connection;
+	int retval;
 
+	retval = pm_runtime_get_sync(dev);
+	if (retval < 0)
+		dev_err(dev, "failed to resume bundle: %d\n", retval);
+
+	/*
+	 * Disable (non-offloaded) connections early in case the interface is
+	 * already gone to avoid unceccessary operation timeouts during
+	 * driver disconnect. Otherwise, only disable incoming requests.
+	 */
 	list_for_each_entry(connection, &bundle->connections, bundle_links) {
+		if (gb_connection_is_offloaded(connection))
+			continue;
+
 		if (bundle->intf->disconnected)
-			gb_connection_disable(connection);
+			gb_connection_disable_forced(connection);
 		else
 			gb_connection_disable_rx(connection);
 	}
@@ -197,6 +255,15 @@ static int greybus_remove(struct device *dev)
 
 	/* Catch buggy drivers that fail to destroy their connections. */
 	WARN_ON(!list_empty(&bundle->connections));
+
+	if (!bundle->intf->disconnected)
+		gb_control_bundle_deactivate(bundle->intf->control, bundle->id);
+
+	pm_runtime_put_noidle(dev);
+	pm_runtime_disable(dev);
+	pm_runtime_set_suspended(dev);
+	pm_runtime_dont_use_autosuspend(dev);
+	pm_runtime_put_noidle(dev);
 
 	return 0;
 }
@@ -260,23 +327,14 @@ static int __init gb_init(void)
 		goto error_operation;
 	}
 
-	retval = gb_bootrom_init();
+	retval = gb_timesync_init();
 	if (retval) {
-		pr_err("gb_bootrom_init failed\n");
-		goto error_bootrom;
+		pr_err("gb_timesync_init failed\n");
+		goto error_timesync;
 	}
-
-	retval = gb_legacy_init();
-	if (retval) {
-		pr_err("gb_legacy_init failed\n");
-		goto error_legacy;
-	}
-
 	return 0;	/* Success */
 
-error_legacy:
-	gb_bootrom_exit();
-error_bootrom:
+error_timesync:
 	gb_operation_exit();
 error_operation:
 	gb_hd_exit();
@@ -291,8 +349,7 @@ module_init(gb_init);
 
 static void __exit gb_exit(void)
 {
-	gb_legacy_exit();
-	gb_bootrom_exit();
+	gb_timesync_exit();
 	gb_operation_exit();
 	gb_hd_exit();
 	bus_unregister(&greybus_bus_type);

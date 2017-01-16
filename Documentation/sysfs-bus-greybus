@@ -82,12 +82,38 @@ Contact:	Greg Kroah-Hartman <greg@kroah.com>
 Description:
 		The ID of a Greybus interface.
 
+What:		/sys/bus/greybus/devices/N-M.I/interface_type
+Date:		June 2016
+KernelVersion:	4.XX
+Contact:	Greg Kroah-Hartman <greg@kroah.com>
+Description:
+		The type of a Greybus interface; "dummy", "unipro", "greybus",
+		or "unknown".
+
 What:		/sys/bus/greybus/devices/N-M.I/power_now
 Date:		March 2016
 KernelVersion:	4.XX
 Contact:	Greg Kroah-Hartman <greg@kroah.com>
 Description:
 		Power measurement of the interface in microwatts (uW)
+
+What:		/sys/bus/greybus/devices/N-M.I/power_state
+Date:		March 2016
+KernelVersion:	4.XX
+Contact:	Greg Kroah-Hartman <greg@kroah.com>
+Description:
+		This file reflects the power state of a Greybus interface. If
+		the value read from it is "on", then power is currently
+		supplied to the interface. Otherwise it will read "off" and
+		power is currently not supplied to the interface.
+
+		If the value read is "off", then writing "on" (or '1', 'y',
+		'Y') to this file will enable power to the interface and an
+		attempt to boot and possibly enumerate it will be made. Note
+		that on errors, the interface will again be powered down.
+
+		If the value read is "on", then writing "off" (or '0', 'n',
+		'N') to this file will power down the interface.
 
 What:		/sys/bus/greybus/devices/N-M.I/product_id
 Date:		October 2015
@@ -197,7 +223,7 @@ Contact:	Greg Kroah-Hartman <greg@kroah.com>
 Description:
 		The AP interface ID, a 1-byte non-zero integer which
 		defines the position of the AP module on the frame.
-		The interface positions are defined in the ARA
+		The interface positions are defined in the GMP
 		Module Developer Kit.
 
 What:		/sys/bus/greybus/devices/N-svc/endo_id
@@ -207,7 +233,7 @@ Contact:	Greg Kroah-Hartman <greg@kroah.com>
 Description:
 		The Endo ID, which is a 2-byte hexadecimal value
 		defined by the Endo layout scheme, documented in
-		the ARA Module Developer Kit.
+		the GMP Module Developer Kit.
 
 What:		/sys/bus/greybus/devices/N-svc/intf_eject
 Date:		October 2015
@@ -231,3 +257,19 @@ Contact:	Greg Kroah-Hartman <greg@kroah.com>
 Description:
 		If the SVC watchdog is enabled or not.  Writing 0 to this
 		file will disable the watchdog, writing 1 will enable it.
+
+What:		/sys/bus/greybus/devices/N-svc/watchdog_action
+Date:		July 2016
+KernelVersion:	4.XX
+Contact:	Greg Kroah-Hartman <greg@kroah.com>
+Description:
+		This attribute indicates the action to be performed upon SVC
+		watchdog bite.
+
+		The action can be one of the "reset" or "panic". Writing either
+		one of the "reset" or "panic" will change the behavior of SVC
+		watchdog bite. Default value is "reset".
+
+		"reset" means the UniPro subsystem is to be reset.
+
+		"panic" means SVC watchdog bite will cause kernel to panic.

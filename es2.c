@@ -11,15 +11,32 @@
 #include <linux/usb.h>
 #include <linux/kfifo.h>
 #include <linux/debugfs.h>
+#include <linux/list.h>
 #include <asm/unaligned.h>
 
+#include "arpc.h"
 #include "greybus.h"
+#include "greybus_trace.h"
 #include "kernel_ver.h"
 #include "connection.h"
-#include "greybus_trace.h"
+
+
+/* Default timeout for USB vendor requests. */
+#define ES2_USB_CTRL_TIMEOUT	500
+
+/* Default timeout for ARPC CPort requests */
+#define ES2_ARPC_CPORT_TIMEOUT	500
+
+/* Fixed CPort numbers */
+#define ES2_CPORT_CDSI0		16
+#define ES2_CPORT_CDSI1		17
 
 /* Memory sizes for the buffers sent to/from the ES2 controller */
 #define ES2_GBUF_MSG_SIZE_MAX	2048
+
+/* Memory sizes for the ARPC buffers */
+#define ARPC_OUT_SIZE_MAX	U16_MAX
+#define ARPC_IN_SIZE_MAX	128
 
 static const struct usb_device_id id_table[] = {
 	{ USB_DEVICE(0x18d1, 0x1eaf) },
@@ -28,9 +45,6 @@ static const struct usb_device_id id_table[] = {
 MODULE_DEVICE_TABLE(usb, id_table);
 
 #define APB1_LOG_SIZE		SZ_16K
-
-/* Number of bulk in and bulk out couple */
-#define NUM_BULKS		7
 
 /*
  * Number of CPort IN urbs in flight at any point in time.
@@ -42,7 +56,12 @@ MODULE_DEVICE_TABLE(usb, id_table);
 /* Number of CPort OUT urbs in flight at any point in time.
  * Adjust if we get messages saying we are out of urbs in the system log.
  */
-#define NUM_CPORT_OUT_URB	(8 * NUM_BULKS)
+#define NUM_CPORT_OUT_URB	8
+
+/*
+ * Number of ARPC in urbs in flight at any point in time.
+ */
+#define NUM_ARPC_IN_URB		2
 
 /*
  * @endpoint: bulk in endpoint for CPort data
@@ -55,13 +74,6 @@ struct es2_cport_in {
 	u8 *buffer[NUM_CPORT_IN_URB];
 };
 
-/*
- * @endpoint: bulk out endpoint for CPort data
- */
-struct es2_cport_out {
-	__u8 endpoint;
-};
-
 /**
  * es2_ap_dev - ES2 USB Bridge to AP structure
  * @usb_dev: pointer to the USB device we are.
@@ -69,7 +81,7 @@ struct es2_cport_out {
  * @hd: pointer to our gb_host_device structure
 
  * @cport_in: endpoint, urbs and buffer for cport in messages
- * @cport_out: endpoint for for cport out messages
+ * @cport_out_endpoint: endpoint for for cport out messages
  * @cport_out_urb: array of urbs for the CPort out messages
  * @cport_out_urb_busy: array of flags to see if the @cport_out_urb is busy or
  *			not.
@@ -81,37 +93,70 @@ struct es2_cport_out {
  * @apb_log_dentry: file system entry for the log file interface
  * @apb_log_enable_dentry: file system entry for enabling logging
  * @apb_log_fifo: kernel FIFO to carry logged data
+ * @arpc_urb: array of urbs for the ARPC in messages
+ * @arpc_buffer: array of buffers for the @arpc_urb urbs
+ * @arpc_endpoint_in: bulk in endpoint for APBridgeA RPC
+ * @arpc_id_cycle: gives an unique id to ARPC
+ * @arpc_lock: locks ARPC list
+ * @arpcs: list of in progress ARPCs
  */
 struct es2_ap_dev {
 	struct usb_device *usb_dev;
 	struct usb_interface *usb_intf;
 	struct gb_host_device *hd;
 
-	struct es2_cport_in cport_in[NUM_BULKS];
-	struct es2_cport_out cport_out[NUM_BULKS];
+	struct es2_cport_in cport_in;
+	__u8 cport_out_endpoint;
 	struct urb *cport_out_urb[NUM_CPORT_OUT_URB];
 	bool cport_out_urb_busy[NUM_CPORT_OUT_URB];
 	bool cport_out_urb_cancelled[NUM_CPORT_OUT_URB];
 	spinlock_t cport_out_urb_lock;
 
-	int *cport_to_ep;
+	bool cdsi1_in_use;
 
 	struct task_struct *apb_log_task;
 	struct dentry *apb_log_dentry;
 	struct dentry *apb_log_enable_dentry;
 	DECLARE_KFIFO(apb_log_fifo, char, APB1_LOG_SIZE);
+
+	__u8 arpc_endpoint_in;
+	struct urb *arpc_urb[NUM_ARPC_IN_URB];
+	u8 *arpc_buffer[NUM_ARPC_IN_URB];
+
+	int arpc_id_cycle;
+	spinlock_t arpc_lock;
+	struct list_head arpcs;
 };
 
 /**
- * cport_to_ep - information about cport to endpoints mapping
- * @cport_id: the id of cport to map to endpoints
- * @endpoint_in: the endpoint number to use for in transfer
- * @endpoint_out: he endpoint number to use for out transfer
+ * timesync_enable_request - Enable timesync in an APBridge
+ * @count: number of TimeSync Pulses to expect
+ * @frame_time: the initial FrameTime at the first TimeSync Pulse
+ * @strobe_delay: the expected delay in microseconds between each TimeSync Pulse
+ * @refclk: The AP mandated reference clock to run FrameTime at
  */
-struct cport_to_ep {
-	__le16 cport_id;
-	__u8 endpoint_in;
-	__u8 endpoint_out;
+struct timesync_enable_request {
+	__u8	count;
+	__le64	frame_time;
+	__le32	strobe_delay;
+	__le32	refclk;
+} __packed;
+
+/**
+ * timesync_authoritative_request - Transmit authoritative FrameTime to APBridge
+ * @frame_time: An array of authoritative FrameTimes provided by the SVC
+ *              and relayed to the APBridge by the AP
+ */
+struct timesync_authoritative_request {
+	__le64	frame_time[GB_TIMESYNC_MAX_STROBES];
+} __packed;
+
+struct arpc {
+	struct list_head list;
+	struct arpc_request_message *req;
+	struct arpc_response_message *resp;
+	struct completion response_received;
+	bool active;
 };
 
 static inline struct es2_ap_dev *hd_to_es2(struct gb_host_device *hd)
@@ -122,75 +167,8 @@ static inline struct es2_ap_dev *hd_to_es2(struct gb_host_device *hd)
 static void cport_out_callback(struct urb *urb);
 static void usb_log_enable(struct es2_ap_dev *es2);
 static void usb_log_disable(struct es2_ap_dev *es2);
-
-/* Get the endpoints pair mapped to the cport */
-static int cport_to_ep_pair(struct es2_ap_dev *es2, u16 cport_id)
-{
-	if (cport_id >= es2->hd->num_cports)
-		return 0;
-	return es2->cport_to_ep[cport_id];
-}
-
-#define ES2_TIMEOUT	500	/* 500 ms for the SVC to do something */
-
-/* Disable for now until we work all of this out to keep a warning-free build */
-#if 0
-/* Test if the endpoints pair is already mapped to a cport */
-static int ep_pair_in_use(struct es2_ap_dev *es2, int ep_pair)
-{
-	int i;
-
-	for (i = 0; i < es2->hd->num_cports; i++) {
-		if (es2->cport_to_ep[i] == ep_pair)
-			return 1;
-	}
-	return 0;
-}
-
-/* Configure the endpoint mapping and send the request to APBridge */
-static int map_cport_to_ep(struct es2_ap_dev *es2,
-				u16 cport_id, int ep_pair)
-{
-	int retval;
-	struct cport_to_ep *cport_to_ep;
-
-	if (ep_pair < 0 || ep_pair >= NUM_BULKS)
-		return -EINVAL;
-	if (cport_id >= es2->hd->num_cports)
-		return -EINVAL;
-	if (ep_pair && ep_pair_in_use(es2, ep_pair))
-		return -EINVAL;
-
-	cport_to_ep = kmalloc(sizeof(*cport_to_ep), GFP_KERNEL);
-	if (!cport_to_ep)
-		return -ENOMEM;
-
-	es2->cport_to_ep[cport_id] = ep_pair;
-	cport_to_ep->cport_id = cpu_to_le16(cport_id);
-	cport_to_ep->endpoint_in = es2->cport_in[ep_pair].endpoint;
-	cport_to_ep->endpoint_out = es2->cport_out[ep_pair].endpoint;
-
-	retval = usb_control_msg(es2->usb_dev,
-				 usb_sndctrlpipe(es2->usb_dev, 0),
-				 GB_APB_REQUEST_EP_MAPPING,
-				 USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_INTERFACE,
-				 0x00, 0x00,
-				 (char *)cport_to_ep,
-				 sizeof(*cport_to_ep),
-				 ES2_TIMEOUT);
-	if (retval == sizeof(*cport_to_ep))
-		retval = 0;
-	kfree(cport_to_ep);
-
-	return retval;
-}
-
-/* Unmap a cport: use the muxed endpoints pair */
-static int unmap_cport(struct es2_ap_dev *es2, u16 cport_id)
-{
-	return map_cport_to_ep(es2, cport_id, 0);
-}
-#endif
+static int arpc_sync(struct es2_ap_dev *es2, u8 type, void *payload,
+		     size_t size, int *result, unsigned int timeout);
 
 static int output_sync(struct es2_ap_dev *es2, void *req, u16 size, u8 cmd)
 {
@@ -207,7 +185,7 @@ static int output_sync(struct es2_ap_dev *es2, void *req, u16 size, u8 cmd)
 				 cmd,
 				 USB_DIR_OUT | USB_TYPE_VENDOR |
 				 USB_RECIP_INTERFACE,
-				 0, 0, data, size, ES2_TIMEOUT);
+				 0, 0, data, size, ES2_USB_CTRL_TIMEOUT);
 	if (retval < 0)
 		dev_err(&udev->dev, "%s: return error %d\n", __func__, retval);
 	else
@@ -315,6 +293,45 @@ static void es2_cport_in_disable(struct es2_ap_dev *es2,
 	}
 }
 
+static int es2_arpc_in_enable(struct es2_ap_dev *es2)
+{
+	struct urb *urb;
+	int ret;
+	int i;
+
+	for (i = 0; i < NUM_ARPC_IN_URB; ++i) {
+		urb = es2->arpc_urb[i];
+
+		ret = usb_submit_urb(urb, GFP_KERNEL);
+		if (ret) {
+			dev_err(&es2->usb_dev->dev,
+				"failed to submit arpc in-urb: %d\n", ret);
+			goto err_kill_urbs;
+		}
+	}
+
+	return 0;
+
+err_kill_urbs:
+	for (--i; i >= 0; --i) {
+		urb = es2->arpc_urb[i];
+		usb_kill_urb(urb);
+	}
+
+	return ret;
+}
+
+static void es2_arpc_in_disable(struct es2_ap_dev *es2)
+{
+	struct urb *urb;
+	int i;
+
+	for (i = 0; i < NUM_ARPC_IN_URB; ++i) {
+		urb = es2->arpc_urb[i];
+		usb_kill_urb(urb);
+	}
+}
+
 static struct urb *next_free_urb(struct es2_ap_dev *es2, gfp_t gfp_mask)
 {
 	struct urb *urb = NULL;
@@ -405,7 +422,6 @@ static int message_send(struct gb_host_device *hd, u16 cport_id,
 	size_t buffer_size;
 	int retval;
 	struct urb *urb;
-	int ep_pair;
 	unsigned long flags;
 
 	/*
@@ -432,14 +448,15 @@ static int message_send(struct gb_host_device *hd, u16 cport_id,
 
 	buffer_size = sizeof(*message->header) + message->payload_size;
 
-	ep_pair = cport_to_ep_pair(es2, cport_id);
 	usb_fill_bulk_urb(urb, udev,
 			  usb_sndbulkpipe(udev,
-					  es2->cport_out[ep_pair].endpoint),
+					  es2->cport_out_endpoint),
 			  message->buffer, buffer_size,
 			  cport_out_callback, message);
 	urb->transfer_flags |= URB_ZERO_PACKET;
-	trace_gb_host_device_send(hd, cport_id, buffer_size);
+
+	trace_gb_message_submit(message);
+
 	retval = usb_submit_urb(urb, gfp_mask);
 	if (retval) {
 		dev_err(&udev->dev, "failed to submit out-urb: %d\n", retval);
@@ -495,34 +512,209 @@ static void message_cancel(struct gb_message *message)
 	usb_free_urb(urb);
 }
 
-static int cport_reset(struct gb_host_device *hd, u16 cport_id)
+static int es2_cport_allocate(struct gb_host_device *hd, int cport_id,
+				unsigned long flags)
+{
+	struct es2_ap_dev *es2 = hd_to_es2(hd);
+	struct ida *id_map = &hd->cport_id_map;
+	int ida_start, ida_end;
+
+	switch (cport_id) {
+	case ES2_CPORT_CDSI0:
+	case ES2_CPORT_CDSI1:
+		dev_err(&hd->dev, "cport %d not available\n", cport_id);
+		return -EBUSY;
+	}
+
+	if (flags & GB_CONNECTION_FLAG_OFFLOADED &&
+			flags & GB_CONNECTION_FLAG_CDSI1) {
+		if (es2->cdsi1_in_use) {
+			dev_err(&hd->dev, "CDSI1 already in use\n");
+			return -EBUSY;
+		}
+
+		es2->cdsi1_in_use = true;
+
+		return ES2_CPORT_CDSI1;
+	}
+
+	if (cport_id < 0) {
+		ida_start = 0;
+		ida_end = hd->num_cports;
+	} else if (cport_id < hd->num_cports) {
+		ida_start = cport_id;
+		ida_end = cport_id + 1;
+	} else {
+		dev_err(&hd->dev, "cport %d not available\n", cport_id);
+		return -EINVAL;
+	}
+
+	return ida_simple_get(id_map, ida_start, ida_end, GFP_KERNEL);
+}
+
+static void es2_cport_release(struct gb_host_device *hd, u16 cport_id)
+{
+	struct es2_ap_dev *es2 = hd_to_es2(hd);
+
+	switch (cport_id) {
+	case ES2_CPORT_CDSI1:
+		es2->cdsi1_in_use = false;
+		return;
+	}
+
+	ida_simple_remove(&hd->cport_id_map, cport_id);
+}
+
+static int cport_enable(struct gb_host_device *hd, u16 cport_id,
+			unsigned long flags)
 {
 	struct es2_ap_dev *es2 = hd_to_es2(hd);
 	struct usb_device *udev = es2->usb_dev;
-	int retval;
+	struct gb_apb_request_cport_flags *req;
+	u32 connection_flags;
+	int ret;
 
-	retval = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
-				 GB_APB_REQUEST_RESET_CPORT,
-				 USB_DIR_OUT | USB_TYPE_VENDOR |
-				 USB_RECIP_INTERFACE, cport_id, 0,
-				 NULL, 0, ES2_TIMEOUT);
-	if (retval < 0) {
-		dev_err(&udev->dev, "failed to reset cport %u: %d\n", cport_id,
-			retval);
-		return retval;
+	req = kzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	connection_flags = 0;
+	if (flags & GB_CONNECTION_FLAG_CONTROL)
+		connection_flags |= GB_APB_CPORT_FLAG_CONTROL;
+	if (flags & GB_CONNECTION_FLAG_HIGH_PRIO)
+		connection_flags |= GB_APB_CPORT_FLAG_HIGH_PRIO;
+
+	req->flags = cpu_to_le32(connection_flags);
+
+	dev_dbg(&hd->dev, "%s - cport = %u, flags = %02x\n", __func__,
+			cport_id, connection_flags);
+
+	ret = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
+				GB_APB_REQUEST_CPORT_FLAGS,
+				USB_DIR_OUT | USB_TYPE_VENDOR |
+				USB_RECIP_INTERFACE, cport_id, 0,
+				req, sizeof(*req), ES2_USB_CTRL_TIMEOUT);
+	if (ret != sizeof(*req)) {
+		dev_err(&udev->dev, "failed to set cport flags for port %d\n",
+				cport_id);
+		if (ret >= 0)
+			ret = -EIO;
+
+		goto out;
+	}
+
+	ret = 0;
+out:
+	kfree(req);
+
+	return ret;
+}
+
+static int es2_cport_connected(struct gb_host_device *hd, u16 cport_id)
+{
+	struct es2_ap_dev *es2 = hd_to_es2(hd);
+	struct device *dev = &es2->usb_dev->dev;
+	struct arpc_cport_connected_req req;
+	int ret;
+
+	req.cport_id = cpu_to_le16(cport_id);
+	ret = arpc_sync(es2, ARPC_TYPE_CPORT_CONNECTED, &req, sizeof(req),
+			NULL, ES2_ARPC_CPORT_TIMEOUT);
+	if (ret) {
+		dev_err(dev, "failed to set connected state for cport %u: %d\n",
+				cport_id, ret);
+		return ret;
 	}
 
 	return 0;
 }
 
-static int cport_enable(struct gb_host_device *hd, u16 cport_id)
+static int es2_cport_flush(struct gb_host_device *hd, u16 cport_id)
 {
-	int retval;
+	struct es2_ap_dev *es2 = hd_to_es2(hd);
+	struct device *dev = &es2->usb_dev->dev;
+	struct arpc_cport_flush_req req;
+	int ret;
 
-	if (cport_id != GB_SVC_CPORT_ID) {
-		retval = cport_reset(hd, cport_id);
-		if (retval)
-			return retval;
+	req.cport_id = cpu_to_le16(cport_id);
+	ret = arpc_sync(es2, ARPC_TYPE_CPORT_FLUSH, &req, sizeof(req),
+			NULL, ES2_ARPC_CPORT_TIMEOUT);
+	if (ret) {
+		dev_err(dev, "failed to flush cport %u: %d\n", cport_id, ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int es2_cport_shutdown(struct gb_host_device *hd, u16 cport_id,
+				u8 phase, unsigned int timeout)
+{
+	struct es2_ap_dev *es2 = hd_to_es2(hd);
+	struct device *dev = &es2->usb_dev->dev;
+	struct arpc_cport_shutdown_req req;
+	int result;
+	int ret;
+
+	if (timeout > U16_MAX)
+		return -EINVAL;
+
+	req.cport_id = cpu_to_le16(cport_id);
+	req.timeout = cpu_to_le16(timeout);
+	req.phase = phase;
+	ret = arpc_sync(es2, ARPC_TYPE_CPORT_SHUTDOWN, &req, sizeof(req),
+			&result, ES2_ARPC_CPORT_TIMEOUT + timeout);
+	if (ret) {
+		dev_err(dev, "failed to send shutdown over cport %u: %d (%d)\n",
+				cport_id, ret, result);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int es2_cport_quiesce(struct gb_host_device *hd, u16 cport_id,
+				size_t peer_space, unsigned int timeout)
+{
+	struct es2_ap_dev *es2 = hd_to_es2(hd);
+	struct device *dev = &es2->usb_dev->dev;
+	struct arpc_cport_quiesce_req req;
+	int result;
+	int ret;
+
+	if (peer_space > U16_MAX)
+		return -EINVAL;
+
+	if (timeout > U16_MAX)
+		return -EINVAL;
+
+	req.cport_id = cpu_to_le16(cport_id);
+	req.peer_space = cpu_to_le16(peer_space);
+	req.timeout = cpu_to_le16(timeout);
+	ret = arpc_sync(es2, ARPC_TYPE_CPORT_QUIESCE, &req, sizeof(req),
+			&result, ES2_ARPC_CPORT_TIMEOUT + timeout);
+	if (ret) {
+		dev_err(dev, "failed to quiesce cport %u: %d (%d)\n",
+				cport_id, ret, result);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int es2_cport_clear(struct gb_host_device *hd, u16 cport_id)
+{
+	struct es2_ap_dev *es2 = hd_to_es2(hd);
+	struct device *dev = &es2->usb_dev->dev;
+	struct arpc_cport_clear_req req;
+	int ret;
+
+	req.cport_id = cpu_to_le16(cport_id);
+	ret = arpc_sync(es2, ARPC_TYPE_CPORT_CLEAR, &req, sizeof(req),
+			NULL, ES2_ARPC_CPORT_TIMEOUT);
+	if (ret) {
+		dev_err(dev, "failed to clear cport %u: %d\n", cport_id, ret);
+		return ret;
 	}
 
 	return 0;
@@ -534,16 +726,11 @@ static int latency_tag_enable(struct gb_host_device *hd, u16 cport_id)
 	struct es2_ap_dev *es2 = hd_to_es2(hd);
 	struct usb_device *udev = es2->usb_dev;
 
-	if (!cport_id_valid(hd, cport_id)) {
-		dev_err(&udev->dev, "invalid cport %u\n", cport_id);
-		return -EINVAL;
-	}
-
 	retval = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
 				 GB_APB_REQUEST_LATENCY_TAG_EN,
 				 USB_DIR_OUT | USB_TYPE_VENDOR |
 				 USB_RECIP_INTERFACE, cport_id, 0, NULL,
-				 0, ES2_TIMEOUT);
+				 0, ES2_USB_CTRL_TIMEOUT);
 
 	if (retval < 0)
 		dev_err(&udev->dev, "Cannot enable latency tag for cport %d\n",
@@ -557,16 +744,11 @@ static int latency_tag_disable(struct gb_host_device *hd, u16 cport_id)
 	struct es2_ap_dev *es2 = hd_to_es2(hd);
 	struct usb_device *udev = es2->usb_dev;
 
-	if (!cport_id_valid(hd, cport_id)) {
-		dev_err(&udev->dev, "invalid cport %u\n", cport_id);
-		return -EINVAL;
-	}
-
 	retval = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
 				 GB_APB_REQUEST_LATENCY_TAG_DIS,
 				 USB_DIR_OUT | USB_TYPE_VENDOR |
 				 USB_RECIP_INTERFACE, cport_id, 0, NULL,
-				 0, ES2_TIMEOUT);
+				 0, ES2_USB_CTRL_TIMEOUT);
 
 	if (retval < 0)
 		dev_err(&udev->dev, "Cannot disable latency tag for cport %d\n",
@@ -574,51 +756,130 @@ static int latency_tag_disable(struct gb_host_device *hd, u16 cport_id)
 	return retval;
 }
 
-static int cport_features_enable(struct gb_host_device *hd, u16 cport_id)
+static int timesync_enable(struct gb_host_device *hd, u8 count,
+			   u64 frame_time, u32 strobe_delay, u32 refclk)
 {
 	int retval;
 	struct es2_ap_dev *es2 = hd_to_es2(hd);
 	struct usb_device *udev = es2->usb_dev;
+	struct gb_control_timesync_enable_request *request;
 
+	request = kzalloc(sizeof(*request), GFP_KERNEL);
+	if (!request)
+		return -ENOMEM;
+
+	request->count = count;
+	request->frame_time = cpu_to_le64(frame_time);
+	request->strobe_delay = cpu_to_le32(strobe_delay);
+	request->refclk = cpu_to_le32(refclk);
 	retval = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
-				 GB_APB_REQUEST_CPORT_FEAT_EN,
+				 GB_APB_REQUEST_TIMESYNC_ENABLE,
 				 USB_DIR_OUT | USB_TYPE_VENDOR |
-				 USB_RECIP_INTERFACE, cport_id, 0, NULL,
-				 0, ES2_TIMEOUT);
+				 USB_RECIP_INTERFACE, 0, 0, request,
+				 sizeof(*request), ES2_USB_CTRL_TIMEOUT);
 	if (retval < 0)
-		dev_err(&udev->dev, "Cannot enable CPort features for cport %u: %d\n",
-			cport_id, retval);
+		dev_err(&udev->dev, "Cannot enable timesync %d\n", retval);
+
+	kfree(request);
 	return retval;
 }
 
-static int cport_features_disable(struct gb_host_device *hd, u16 cport_id)
+static int timesync_disable(struct gb_host_device *hd)
 {
 	int retval;
 	struct es2_ap_dev *es2 = hd_to_es2(hd);
 	struct usb_device *udev = es2->usb_dev;
 
 	retval = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
-				 GB_APB_REQUEST_CPORT_FEAT_DIS,
+				 GB_APB_REQUEST_TIMESYNC_DISABLE,
 				 USB_DIR_OUT | USB_TYPE_VENDOR |
-				 USB_RECIP_INTERFACE, cport_id, 0, NULL,
-				 0, ES2_TIMEOUT);
+				 USB_RECIP_INTERFACE, 0, 0, NULL,
+				 0, ES2_USB_CTRL_TIMEOUT);
 	if (retval < 0)
-		dev_err(&udev->dev,
-			"Cannot disable CPort features for cport %u: %d\n",
-			cport_id, retval);
+		dev_err(&udev->dev, "Cannot disable timesync %d\n", retval);
+
+	return retval;
+}
+
+static int timesync_authoritative(struct gb_host_device *hd, u64 *frame_time)
+{
+	int retval, i;
+	struct es2_ap_dev *es2 = hd_to_es2(hd);
+	struct usb_device *udev = es2->usb_dev;
+	struct timesync_authoritative_request *request;
+
+	request = kzalloc(sizeof(*request), GFP_KERNEL);
+	if (!request)
+		return -ENOMEM;
+
+	for (i = 0; i < GB_TIMESYNC_MAX_STROBES; i++)
+		request->frame_time[i] = cpu_to_le64(frame_time[i]);
+
+	retval = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
+				 GB_APB_REQUEST_TIMESYNC_AUTHORITATIVE,
+				 USB_DIR_OUT | USB_TYPE_VENDOR |
+				 USB_RECIP_INTERFACE, 0, 0, request,
+				 sizeof(*request), ES2_USB_CTRL_TIMEOUT);
+	if (retval < 0)
+		dev_err(&udev->dev, "Cannot timesync authoritative out %d\n", retval);
+
+	kfree(request);
+	return retval;
+}
+
+static int timesync_get_last_event(struct gb_host_device *hd, u64 *frame_time)
+{
+	int retval;
+	struct es2_ap_dev *es2 = hd_to_es2(hd);
+	struct usb_device *udev = es2->usb_dev;
+	__le64 *response_frame_time;
+
+	response_frame_time = kzalloc(sizeof(*response_frame_time), GFP_KERNEL);
+	if (!response_frame_time)
+		return -ENOMEM;
+
+	retval = usb_control_msg(udev, usb_rcvctrlpipe(udev, 0),
+				 GB_APB_REQUEST_TIMESYNC_GET_LAST_EVENT,
+				 USB_DIR_IN | USB_TYPE_VENDOR |
+				 USB_RECIP_INTERFACE, 0, 0, response_frame_time,
+				 sizeof(*response_frame_time),
+				 ES2_USB_CTRL_TIMEOUT);
+
+	if (retval != sizeof(*response_frame_time)) {
+		dev_err(&udev->dev, "Cannot get last TimeSync event: %d\n",
+			retval);
+
+		if (retval >= 0)
+			retval = -EIO;
+
+		goto out;
+	}
+	*frame_time = le64_to_cpu(*response_frame_time);
+	retval = 0;
+out:
+	kfree(response_frame_time);
 	return retval;
 }
 
 static struct gb_hd_driver es2_driver = {
-	.hd_priv_size		= sizeof(struct es2_ap_dev),
-	.message_send		= message_send,
-	.message_cancel		= message_cancel,
-	.cport_enable		= cport_enable,
-	.latency_tag_enable	= latency_tag_enable,
-	.latency_tag_disable	= latency_tag_disable,
-	.output			= output,
-	.cport_features_enable	= cport_features_enable,
-	.cport_features_disable	= cport_features_disable,
+	.hd_priv_size			= sizeof(struct es2_ap_dev),
+	.message_send			= message_send,
+	.message_cancel			= message_cancel,
+	.cport_allocate			= es2_cport_allocate,
+	.cport_release			= es2_cport_release,
+	.cport_enable			= cport_enable,
+	.cport_connected		= es2_cport_connected,
+	.cport_flush			= es2_cport_flush,
+	.cport_shutdown			= es2_cport_shutdown,
+	.cport_quiesce			= es2_cport_quiesce,
+	.cport_clear			= es2_cport_clear,
+	.latency_tag_enable		= latency_tag_enable,
+	.latency_tag_disable		= latency_tag_disable,
+	.output				= output,
+	.timesync_enable		= timesync_enable,
+	.timesync_disable		= timesync_disable,
+	.timesync_authoritative		= timesync_authoritative,
+	.timesync_get_last_event	= timesync_get_last_event,
 };
 
 /* Common function to report consistent warnings based on URB status */
@@ -650,7 +911,7 @@ static int check_urb_status(struct urb *urb)
 static void es2_destroy(struct es2_ap_dev *es2)
 {
 	struct usb_device *udev;
-	int bulk_in;
+	struct urb *urb;
 	int i;
 
 	debugfs_remove(es2->apb_log_enable_dentry);
@@ -658,31 +919,28 @@ static void es2_destroy(struct es2_ap_dev *es2)
 
 	/* Tear down everything! */
 	for (i = 0; i < NUM_CPORT_OUT_URB; ++i) {
-		struct urb *urb = es2->cport_out_urb[i];
-
-		if (!urb)
-			break;
+		urb = es2->cport_out_urb[i];
 		usb_kill_urb(urb);
 		usb_free_urb(urb);
 		es2->cport_out_urb[i] = NULL;
 		es2->cport_out_urb_busy[i] = false;	/* just to be anal */
 	}
 
-	for (bulk_in = 0; bulk_in < NUM_BULKS; bulk_in++) {
-		struct es2_cport_in *cport_in = &es2->cport_in[bulk_in];
-
-		for (i = 0; i < NUM_CPORT_IN_URB; ++i) {
-			struct urb *urb = cport_in->urb[i];
-
-			if (!urb)
-				break;
-			usb_free_urb(urb);
-			kfree(cport_in->buffer[i]);
-			cport_in->buffer[i] = NULL;
-		}
+	for (i = 0; i < NUM_ARPC_IN_URB; ++i) {
+		usb_free_urb(es2->arpc_urb[i]);
+		kfree(es2->arpc_buffer[i]);
+		es2->arpc_buffer[i] = NULL;
 	}
 
-	kfree(es2->cport_to_ep);
+	for (i = 0; i < NUM_CPORT_IN_URB; ++i) {
+		usb_free_urb(es2->cport_in.urb[i]);
+		kfree(es2->cport_in.buffer[i]);
+		es2->cport_in.buffer[i] = NULL;
+	}
+
+	/* release reserved CDSI0 and CDSI1 cports */
+	gb_hd_cport_release_reserved(es2->hd, ES2_CPORT_CDSI1);
+	gb_hd_cport_release_reserved(es2->hd, ES2_CPORT_CDSI0);
 
 	udev = es2->usb_dev;
 	gb_hd_put(es2->hd);
@@ -721,7 +979,6 @@ static void cport_in_callback(struct urb *urb)
 	cport_id = gb_message_cport_unpack(header);
 
 	if (cport_id_valid(hd, cport_id)) {
-		trace_gb_host_device_recv(hd, cport_id, urb->actual_length);
 		greybus_data_rcvd(hd, cport_id, urb->transfer_buffer,
 							urb->actual_length);
 	} else {
@@ -757,12 +1014,207 @@ static void cport_out_callback(struct urb *urb)
 	free_urb(es2, urb);
 }
 
+static struct arpc *arpc_alloc(void *payload, u16 size, u8 type)
+{
+	struct arpc *rpc;
+
+	if (size + sizeof(*rpc->req) > ARPC_OUT_SIZE_MAX)
+		return NULL;
+
+	rpc = kzalloc(sizeof(*rpc), GFP_KERNEL);
+	if (!rpc)
+		return NULL;
+
+	INIT_LIST_HEAD(&rpc->list);
+	rpc->req = kzalloc(sizeof(*rpc->req) + size, GFP_KERNEL);
+	if (!rpc->req)
+		goto err_free_rpc;
+
+	rpc->resp = kzalloc(sizeof(*rpc->resp), GFP_KERNEL);
+	if (!rpc->resp)
+		goto err_free_req;
+
+	rpc->req->type = type;
+	rpc->req->size = cpu_to_le16(sizeof(rpc->req) + size);
+	memcpy(rpc->req->data, payload, size);
+
+	init_completion(&rpc->response_received);
+
+	return rpc;
+
+err_free_req:
+	kfree(rpc->req);
+err_free_rpc:
+	kfree(rpc);
+
+	return NULL;
+}
+
+static void arpc_free(struct arpc *rpc)
+{
+	kfree(rpc->req);
+	kfree(rpc->resp);
+	kfree(rpc);
+}
+
+static struct arpc *arpc_find(struct es2_ap_dev *es2, __le16 id)
+{
+	struct arpc *rpc;
+
+	list_for_each_entry(rpc, &es2->arpcs, list) {
+		if (rpc->req->id == id)
+			return rpc;
+	}
+
+	return NULL;
+}
+
+static void arpc_add(struct es2_ap_dev *es2, struct arpc *rpc)
+{
+	rpc->active = true;
+	rpc->req->id = cpu_to_le16(es2->arpc_id_cycle++);
+	list_add_tail(&rpc->list, &es2->arpcs);
+}
+
+static void arpc_del(struct es2_ap_dev *es2, struct arpc *rpc)
+{
+	if (rpc->active) {
+		rpc->active = false;
+		list_del(&rpc->list);
+	}
+}
+
+static int arpc_send(struct es2_ap_dev *es2, struct arpc *rpc, int timeout)
+{
+	struct usb_device *udev = es2->usb_dev;
+	int retval;
+
+	retval = usb_control_msg(udev, usb_sndctrlpipe(udev, 0),
+				 GB_APB_REQUEST_ARPC_RUN,
+				 USB_DIR_OUT | USB_TYPE_VENDOR |
+				 USB_RECIP_INTERFACE,
+				 0, 0,
+				 rpc->req, le16_to_cpu(rpc->req->size),
+				 ES2_USB_CTRL_TIMEOUT);
+	if (retval != le16_to_cpu(rpc->req->size)) {
+		dev_err(&udev->dev,
+			"failed to send ARPC request %d: %d\n",
+			rpc->req->type, retval);
+		if (retval > 0)
+			retval = -EIO;
+		return retval;
+	}
+
+	return 0;
+}
+
+static int arpc_sync(struct es2_ap_dev *es2, u8 type, void *payload,
+		     size_t size, int *result, unsigned int timeout)
+{
+	struct arpc *rpc;
+	unsigned long flags;
+	int retval;
+
+	if (result)
+		*result = 0;
+
+	rpc = arpc_alloc(payload, size, type);
+	if (!rpc)
+		return -ENOMEM;
+
+	spin_lock_irqsave(&es2->arpc_lock, flags);
+	arpc_add(es2, rpc);
+	spin_unlock_irqrestore(&es2->arpc_lock, flags);
+
+	retval = arpc_send(es2, rpc, timeout);
+	if (retval)
+		goto out_arpc_del;
+
+	retval = wait_for_completion_interruptible_timeout(
+						&rpc->response_received,
+						msecs_to_jiffies(timeout));
+	if (retval <= 0) {
+		if (!retval)
+			retval = -ETIMEDOUT;
+		goto out_arpc_del;
+	}
+
+	if (rpc->resp->result) {
+		retval = -EREMOTEIO;
+		if (result)
+			*result = rpc->resp->result;
+	} else {
+		retval = 0;
+	}
+
+out_arpc_del:
+	spin_lock_irqsave(&es2->arpc_lock, flags);
+	arpc_del(es2, rpc);
+	spin_unlock_irqrestore(&es2->arpc_lock, flags);
+	arpc_free(rpc);
+
+	if (retval < 0 && retval != -EREMOTEIO) {
+		dev_err(&es2->usb_dev->dev,
+			"failed to execute ARPC: %d\n", retval);
+	}
+
+	return retval;
+}
+
+static void arpc_in_callback(struct urb *urb)
+{
+	struct es2_ap_dev *es2 = urb->context;
+	struct device *dev = &urb->dev->dev;
+	int status = check_urb_status(urb);
+	struct arpc *rpc;
+	struct arpc_response_message *resp;
+	unsigned long flags;
+	int retval;
+
+	if (status) {
+		if ((status == -EAGAIN) || (status == -EPROTO))
+			goto exit;
+
+		/* The urb is being unlinked */
+		if (status == -ENOENT || status == -ESHUTDOWN)
+			return;
+
+		dev_err(dev, "arpc in-urb error %d (dropped)\n", status);
+		return;
+	}
+
+	if (urb->actual_length < sizeof(*resp)) {
+		dev_err(dev, "short aprc response received\n");
+		goto exit;
+	}
+
+	resp = urb->transfer_buffer;
+	spin_lock_irqsave(&es2->arpc_lock, flags);
+	rpc = arpc_find(es2, resp->id);
+	if (!rpc) {
+		dev_err(dev, "invalid arpc response id received: %u\n",
+			le16_to_cpu(resp->id));
+		spin_unlock_irqrestore(&es2->arpc_lock, flags);
+		goto exit;
+	}
+
+	arpc_del(es2, rpc);
+	memcpy(rpc->resp, resp, sizeof(*resp));
+	complete(&rpc->response_received);
+	spin_unlock_irqrestore(&es2->arpc_lock, flags);
+
+exit:
+	/* put our urb back in the request pool */
+	retval = usb_submit_urb(urb, GFP_ATOMIC);
+	if (retval)
+		dev_err(dev, "failed to resubmit arpc in-urb: %d\n", retval);
+}
+
 #define APB1_LOG_MSG_SIZE	64
 static void apb_log_get(struct es2_ap_dev *es2, char *buf)
 {
 	int retval;
 
-	/* SVC messages go down our control pipe */
 	do {
 		retval = usb_control_msg(es2->usb_dev,
 					usb_rcvctrlpipe(es2->usb_dev, 0),
@@ -771,7 +1223,7 @@ static void apb_log_get(struct es2_ap_dev *es2, char *buf)
 					0x00, 0x00,
 					buf,
 					APB1_LOG_MSG_SIZE,
-					ES2_TIMEOUT);
+					ES2_USB_CTRL_TIMEOUT);
 		if (retval > 0)
 			kfifo_in(&es2->apb_log_fifo, buf, retval);
 	} while (retval > 0);
@@ -898,7 +1350,7 @@ static int apb_get_cport_count(struct usb_device *udev)
 				 GB_APB_REQUEST_CPORT_COUNT,
 				 USB_DIR_IN | USB_TYPE_VENDOR |
 				 USB_RECIP_INTERFACE, 0, 0, cport_count,
-				 sizeof(*cport_count), ES2_TIMEOUT);
+				 sizeof(*cport_count), ES2_USB_CTRL_TIMEOUT);
 	if (retval != sizeof(*cport_count)) {
 		dev_err(&udev->dev, "Cannot retrieve CPort count: %d\n",
 			retval);
@@ -936,12 +1388,13 @@ static int ap_probe(struct usb_interface *interface,
 	struct usb_device *udev;
 	struct usb_host_interface *iface_desc;
 	struct usb_endpoint_descriptor *endpoint;
-	int bulk_in = 0;
-	int bulk_out = 0;
-	int retval = -ENOMEM;
+	__u8 ep_addr;
+	int retval;
 	int i;
 	int num_cports;
-	int cport_id;
+	bool bulk_out_found = false;
+	bool bulk_in_found = false;
+	bool arpc_in_found = false;
 
 	udev = usb_get_dev(interface_to_usbdev(interface));
 
@@ -960,14 +1413,6 @@ static int ap_probe(struct usb_interface *interface,
 		return PTR_ERR(hd);
 	}
 
-	/*
-	 * CPorts 16 and 17 are reserved for CDSI0 and CDSI1, make sure they
-	 * won't be allocated dynamically.
-	 */
-	do {
-		cport_id = ida_simple_get(&hd->cport_id_map, 16, 18, GFP_KERNEL);
-	} while (cport_id > 0);
-
 	es2 = hd_to_es2(hd);
 	es2->hd = hd;
 	es2->usb_intf = interface;
@@ -976,58 +1421,109 @@ static int ap_probe(struct usb_interface *interface,
 	INIT_KFIFO(es2->apb_log_fifo);
 	usb_set_intfdata(interface, es2);
 
-	es2->cport_to_ep = kcalloc(hd->num_cports, sizeof(*es2->cport_to_ep),
-				   GFP_KERNEL);
-	if (!es2->cport_to_ep) {
-		retval = -ENOMEM;
+	/*
+	 * Reserve the CDSI0 and CDSI1 CPorts so they won't be allocated
+	 * dynamically.
+	 */
+	retval = gb_hd_cport_reserve(hd, ES2_CPORT_CDSI0);
+	if (retval)
 		goto error;
-	}
+	retval = gb_hd_cport_reserve(hd, ES2_CPORT_CDSI1);
+	if (retval)
+		goto error;
 
 	/* find all bulk endpoints */
 	iface_desc = interface->cur_altsetting;
 	for (i = 0; i < iface_desc->desc.bNumEndpoints; ++i) {
 		endpoint = &iface_desc->endpoint[i].desc;
+		ep_addr = endpoint->bEndpointAddress;
 
 		if (usb_endpoint_is_bulk_in(endpoint)) {
-			es2->cport_in[bulk_in++].endpoint =
-				endpoint->bEndpointAddress;
-		} else if (usb_endpoint_is_bulk_out(endpoint)) {
-			es2->cport_out[bulk_out++].endpoint =
-				endpoint->bEndpointAddress;
-		} else {
-			dev_err(&udev->dev,
-				"Unknown endpoint type found, address 0x%02x\n",
-				endpoint->bEndpointAddress);
+			if (!bulk_in_found) {
+				es2->cport_in.endpoint = ep_addr;
+				bulk_in_found = true;
+			} else if (!arpc_in_found) {
+				es2->arpc_endpoint_in = ep_addr;
+				arpc_in_found = true;
+			} else {
+				dev_warn(&udev->dev,
+					 "Unused bulk IN endpoint found: 0x%02x\n",
+					 ep_addr);
+			}
+			continue;
 		}
+		if (usb_endpoint_is_bulk_out(endpoint)) {
+			if (!bulk_out_found) {
+				es2->cport_out_endpoint = ep_addr;
+				bulk_out_found = true;
+			} else {
+				dev_warn(&udev->dev,
+					 "Unused bulk OUT endpoint found: 0x%02x\n",
+					 ep_addr);
+			}
+			continue;
+		}
+		dev_warn(&udev->dev,
+			 "Unknown endpoint type found, address 0x%02x\n",
+			 ep_addr);
 	}
-	if (bulk_in != NUM_BULKS || bulk_out != NUM_BULKS) {
+	if (!bulk_in_found || !arpc_in_found || !bulk_out_found) {
 		dev_err(&udev->dev, "Not enough endpoints found in device, aborting!\n");
+		retval = -ENODEV;
 		goto error;
 	}
 
 	/* Allocate buffers for our cport in messages */
-	for (bulk_in = 0; bulk_in < NUM_BULKS; bulk_in++) {
-		struct es2_cport_in *cport_in = &es2->cport_in[bulk_in];
+	for (i = 0; i < NUM_CPORT_IN_URB; ++i) {
+		struct urb *urb;
+		u8 *buffer;
 
-		for (i = 0; i < NUM_CPORT_IN_URB; ++i) {
-			struct urb *urb;
-			u8 *buffer;
-
-			urb = usb_alloc_urb(0, GFP_KERNEL);
-			if (!urb)
-				goto error;
-			buffer = kmalloc(ES2_GBUF_MSG_SIZE_MAX, GFP_KERNEL);
-			if (!buffer)
-				goto error;
-
-			usb_fill_bulk_urb(urb, udev,
-					  usb_rcvbulkpipe(udev,
-							  cport_in->endpoint),
-					  buffer, ES2_GBUF_MSG_SIZE_MAX,
-					  cport_in_callback, hd);
-			cport_in->urb[i] = urb;
-			cport_in->buffer[i] = buffer;
+		urb = usb_alloc_urb(0, GFP_KERNEL);
+		if (!urb) {
+			retval = -ENOMEM;
+			goto error;
 		}
+		es2->cport_in.urb[i] = urb;
+
+		buffer = kmalloc(ES2_GBUF_MSG_SIZE_MAX, GFP_KERNEL);
+		if (!buffer) {
+			retval = -ENOMEM;
+			goto error;
+		}
+
+		usb_fill_bulk_urb(urb, udev,
+				  usb_rcvbulkpipe(udev, es2->cport_in.endpoint),
+				  buffer, ES2_GBUF_MSG_SIZE_MAX,
+				  cport_in_callback, hd);
+
+		es2->cport_in.buffer[i] = buffer;
+	}
+
+	/* Allocate buffers for ARPC in messages */
+	for (i = 0; i < NUM_ARPC_IN_URB; ++i) {
+		struct urb *urb;
+		u8 *buffer;
+
+		urb = usb_alloc_urb(0, GFP_KERNEL);
+		if (!urb) {
+			retval = -ENOMEM;
+			goto error;
+		}
+		es2->arpc_urb[i] = urb;
+
+		buffer = kmalloc(ARPC_IN_SIZE_MAX, GFP_KERNEL);
+		if (!buffer) {
+			retval = -ENOMEM;
+			goto error;
+		}
+
+		usb_fill_bulk_urb(urb, udev,
+				  usb_rcvbulkpipe(udev,
+						  es2->arpc_endpoint_in),
+				  buffer, ARPC_IN_SIZE_MAX,
+				  arpc_in_callback, es2);
+
+		es2->arpc_buffer[i] = buffer;
 	}
 
 	/* Allocate urbs for our CPort OUT messages */
@@ -1035,8 +1531,10 @@ static int ap_probe(struct usb_interface *interface,
 		struct urb *urb;
 
 		urb = usb_alloc_urb(0, GFP_KERNEL);
-		if (!urb)
+		if (!urb) {
+			retval = -ENOMEM;
 			goto error;
+		}
 
 		es2->cport_out_urb[i] = urb;
 		es2->cport_out_urb_busy[i] = false;	/* just to be anal */
@@ -1048,22 +1546,26 @@ static int ap_probe(struct usb_interface *interface,
 							gb_debugfs_get(), es2,
 							&apb_log_enable_fops);
 
-	retval = gb_hd_add(hd);
-	if (retval)
+	INIT_LIST_HEAD(&es2->arpcs);
+	spin_lock_init(&es2->arpc_lock);
+
+	if (es2_arpc_in_enable(es2))
 		goto error;
 
-	for (i = 0; i < NUM_BULKS; ++i) {
-		retval = es2_cport_in_enable(es2, &es2->cport_in[i]);
-		if (retval)
-			goto err_disable_cport_in;
-	}
+	retval = gb_hd_add(hd);
+	if (retval)
+		goto err_disable_arpc_in;
+
+	retval = es2_cport_in_enable(es2, &es2->cport_in);
+	if (retval)
+		goto err_hd_del;
 
 	return 0;
 
-err_disable_cport_in:
-	for (--i; i >= 0; --i)
-		es2_cport_in_disable(es2, &es2->cport_in[i]);
+err_hd_del:
 	gb_hd_del(hd);
+err_disable_arpc_in:
+	es2_arpc_in_disable(es2);
 error:
 	es2_destroy(es2);
 
@@ -1073,12 +1575,11 @@ error:
 static void ap_disconnect(struct usb_interface *interface)
 {
 	struct es2_ap_dev *es2 = usb_get_intfdata(interface);
-	int i;
 
 	gb_hd_del(es2->hd);
 
-	for (i = 0; i < NUM_BULKS; ++i)
-		es2_cport_in_disable(es2, &es2->cport_in[i]);
+	es2_cport_in_disable(es2, &es2->cport_in);
+	es2_arpc_in_disable(es2);
 
 	es2_destroy(es2);
 }

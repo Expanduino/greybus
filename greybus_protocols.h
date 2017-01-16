@@ -96,18 +96,13 @@ struct gb_operation_msg_hdr {
 
 
 /* Generic request types */
-#define GB_REQUEST_TYPE_PROTOCOL_VERSION	0x01
+#define GB_REQUEST_TYPE_CPORT_SHUTDOWN		0x00
 #define GB_REQUEST_TYPE_INVALID			0x7f
 
-struct gb_protocol_version_request {
-	__u8	major;
-	__u8	minor;
+struct gb_cport_shutdown_request {
+	__u8 phase;
 } __packed;
 
-struct gb_protocol_version_response {
-	__u8	major;
-	__u8	minor;
-} __packed;
 
 /* Control Protocol */
 
@@ -123,7 +118,16 @@ struct gb_protocol_version_response {
 #define GB_CONTROL_TYPE_TIMESYNC_AUTHORITATIVE	0x09
 /*	Unused					0x0a */
 #define GB_CONTROL_TYPE_BUNDLE_VERSION		0x0b
+#define GB_CONTROL_TYPE_DISCONNECTING		0x0c
+#define GB_CONTROL_TYPE_TIMESYNC_GET_LAST_EVENT	0x0d
 #define GB_CONTROL_TYPE_MODE_SWITCH		0x0e
+#define GB_CONTROL_TYPE_BUNDLE_SUSPEND		0x0f
+#define GB_CONTROL_TYPE_BUNDLE_RESUME		0x10
+#define GB_CONTROL_TYPE_BUNDLE_DEACTIVATE	0x11
+#define GB_CONTROL_TYPE_BUNDLE_ACTIVATE		0x12
+#define GB_CONTROL_TYPE_INTF_SUSPEND_PREPARE		0x13
+#define GB_CONTROL_TYPE_INTF_DEACTIVATE_PREPARE	0x14
+#define GB_CONTROL_TYPE_INTF_HIBERNATE_ABORT	0x15
 
 struct gb_control_version_request {
 	__u8	major;
@@ -159,6 +163,11 @@ struct gb_control_connected_request {
 	__le16			cport_id;
 } __packed;
 
+struct gb_control_disconnecting_request {
+	__le16			cport_id;
+} __packed;
+/* disconnecting response has no payload */
+
 struct gb_control_disconnected_request {
 	__le16			cport_id;
 } __packed;
@@ -179,33 +188,86 @@ struct gb_control_timesync_authoritative_request {
 } __packed;
 /* timesync authoritative response has no payload */
 
+/* timesync get_last_event_request has no payload */
+struct gb_control_timesync_get_last_event_response {
+	__le64	frame_time;
+} __packed;
+
+/*
+ * All Bundle power management operations use the same request and response
+ * layout and status codes.
+ */
+
+#define GB_CONTROL_BUNDLE_PM_OK		0x00
+#define GB_CONTROL_BUNDLE_PM_INVAL	0x01
+#define GB_CONTROL_BUNDLE_PM_BUSY	0x02
+#define GB_CONTROL_BUNDLE_PM_FAIL	0x03
+#define GB_CONTROL_BUNDLE_PM_NA		0x04
+
+struct gb_control_bundle_pm_request {
+	__u8	bundle_id;
+} __packed;
+
+struct gb_control_bundle_pm_response {
+	__u8	status;
+} __packed;
+
+/*
+ * Interface Suspend Prepare and Deactivate Prepare operations use the same
+ * response layout and error codes. Define a single response structure and reuse
+ * it. Both operations have no payload.
+ */
+
+#define GB_CONTROL_INTF_PM_OK		0x00
+#define GB_CONTROL_INTF_PM_BUSY		0x01
+#define GB_CONTROL_INTF_PM_NA		0x02
+
+struct gb_control_intf_pm_response {
+	__u8	status;
+} __packed;
+
 /* APBridge protocol */
 
 /* request APB1 log */
-#define GB_APB_REQUEST_LOG		0x02
+#define GB_APB_REQUEST_LOG			0x02
 
 /* request to map a cport to bulk in and bulk out endpoints */
-#define GB_APB_REQUEST_EP_MAPPING	0x03
+#define GB_APB_REQUEST_EP_MAPPING		0x03
 
 /* request to get the number of cports available */
-#define GB_APB_REQUEST_CPORT_COUNT	0x04
+#define GB_APB_REQUEST_CPORT_COUNT		0x04
 
 /* request to reset a cport state */
-#define GB_APB_REQUEST_RESET_CPORT	0x05
+#define GB_APB_REQUEST_RESET_CPORT		0x05
 
 /* request to time the latency of messages on a given cport */
-#define GB_APB_REQUEST_LATENCY_TAG_EN	0x06
-#define GB_APB_REQUEST_LATENCY_TAG_DIS	0x07
+#define GB_APB_REQUEST_LATENCY_TAG_EN		0x06
+#define GB_APB_REQUEST_LATENCY_TAG_DIS		0x07
 
 /* request to control the CSI transmitter */
-#define GB_APB_REQUEST_CSI_TX_CONTROL	0x08
+#define GB_APB_REQUEST_CSI_TX_CONTROL		0x08
 
-/* request to control the CSI transmitter */
-#define GB_APB_REQUEST_AUDIO_CONTROL	0x09
+/* request to control audio streaming */
+#define GB_APB_REQUEST_AUDIO_CONTROL		0x09
 
-/* vendor requests to enable/disable CPort features */
-#define GB_APB_REQUEST_CPORT_FEAT_EN	0x0b
-#define GB_APB_REQUEST_CPORT_FEAT_DIS	0x0c
+/* TimeSync requests */
+#define GB_APB_REQUEST_TIMESYNC_ENABLE		0x0d
+#define GB_APB_REQUEST_TIMESYNC_DISABLE		0x0e
+#define GB_APB_REQUEST_TIMESYNC_AUTHORITATIVE	0x0f
+#define GB_APB_REQUEST_TIMESYNC_GET_LAST_EVENT	0x10
+
+/* requests to set Greybus CPort flags */
+#define GB_APB_REQUEST_CPORT_FLAGS		0x11
+
+/* ARPC request */
+#define GB_APB_REQUEST_ARPC_RUN			0x12
+
+struct gb_apb_request_cport_flags {
+	__le32	flags;
+#define GB_APB_CPORT_FLAG_CONTROL		0x01
+#define GB_APB_CPORT_FLAG_HIGH_PRIO		0x02
+} __packed;
+
 
 /* Firmware Download Protocol */
 
@@ -214,11 +276,11 @@ struct gb_control_timesync_authoritative_request {
 #define GB_FW_DOWNLOAD_TYPE_FETCH_FIRMWARE	0x02
 #define GB_FW_DOWNLOAD_TYPE_RELEASE_FIRMWARE	0x03
 
-#define GB_FIRMWARE_TAG_MAX_LEN			10
+#define GB_FIRMWARE_TAG_MAX_SIZE		10
 
 /* firmware download find firmware request/response */
 struct gb_fw_download_find_firmware_request {
-	__u8			firmware_tag[GB_FIRMWARE_TAG_MAX_LEN];
+	__u8			firmware_tag[GB_FIRMWARE_TAG_MAX_SIZE];
 } __packed;
 
 struct gb_fw_download_find_firmware_response {
@@ -242,6 +304,125 @@ struct gb_fw_download_release_firmware_request {
 	__u8			firmware_id;
 } __packed;
 /* firmware download release firmware response has no payload */
+
+
+/* Firmware Management Protocol */
+
+/* Request Types */
+#define GB_FW_MGMT_TYPE_INTERFACE_FW_VERSION	0x01
+#define GB_FW_MGMT_TYPE_LOAD_AND_VALIDATE_FW	0x02
+#define GB_FW_MGMT_TYPE_LOADED_FW		0x03
+#define GB_FW_MGMT_TYPE_BACKEND_FW_VERSION	0x04
+#define GB_FW_MGMT_TYPE_BACKEND_FW_UPDATE	0x05
+#define GB_FW_MGMT_TYPE_BACKEND_FW_UPDATED	0x06
+
+#define GB_FW_LOAD_METHOD_UNIPRO		0x01
+#define GB_FW_LOAD_METHOD_INTERNAL		0x02
+
+#define GB_FW_LOAD_STATUS_FAILED		0x00
+#define GB_FW_LOAD_STATUS_UNVALIDATED		0x01
+#define GB_FW_LOAD_STATUS_VALIDATED		0x02
+#define GB_FW_LOAD_STATUS_VALIDATION_FAILED	0x03
+
+#define GB_FW_BACKEND_FW_STATUS_SUCCESS		0x01
+#define GB_FW_BACKEND_FW_STATUS_FAIL_FIND	0x02
+#define GB_FW_BACKEND_FW_STATUS_FAIL_FETCH	0x03
+#define GB_FW_BACKEND_FW_STATUS_FAIL_WRITE	0x04
+#define GB_FW_BACKEND_FW_STATUS_INT		0x05
+#define GB_FW_BACKEND_FW_STATUS_RETRY		0x06
+#define GB_FW_BACKEND_FW_STATUS_NOT_SUPPORTED	0x07
+
+#define GB_FW_BACKEND_VERSION_STATUS_SUCCESS		0x01
+#define GB_FW_BACKEND_VERSION_STATUS_NOT_AVAILABLE	0x02
+#define GB_FW_BACKEND_VERSION_STATUS_NOT_SUPPORTED	0x03
+#define GB_FW_BACKEND_VERSION_STATUS_RETRY		0x04
+#define GB_FW_BACKEND_VERSION_STATUS_FAIL_INT		0x05
+
+/* firmware management interface firmware version request has no payload */
+struct gb_fw_mgmt_interface_fw_version_response {
+	__u8			firmware_tag[GB_FIRMWARE_TAG_MAX_SIZE];
+	__le16			major;
+	__le16			minor;
+} __packed;
+
+/* firmware management load and validate firmware request/response */
+struct gb_fw_mgmt_load_and_validate_fw_request {
+	__u8			request_id;
+	__u8			load_method;
+	__u8			firmware_tag[GB_FIRMWARE_TAG_MAX_SIZE];
+} __packed;
+/* firmware management load and validate firmware response has no payload*/
+
+/* firmware management loaded firmware request */
+struct gb_fw_mgmt_loaded_fw_request {
+	__u8			request_id;
+	__u8			status;
+	__le16			major;
+	__le16			minor;
+} __packed;
+/* firmware management loaded firmware response has no payload */
+
+/* firmware management backend firmware version request/response */
+struct gb_fw_mgmt_backend_fw_version_request {
+	__u8			firmware_tag[GB_FIRMWARE_TAG_MAX_SIZE];
+} __packed;
+
+struct gb_fw_mgmt_backend_fw_version_response {
+	__le16			major;
+	__le16			minor;
+	__u8			status;
+} __packed;
+
+/* firmware management backend firmware update request */
+struct gb_fw_mgmt_backend_fw_update_request {
+	__u8			request_id;
+	__u8			firmware_tag[GB_FIRMWARE_TAG_MAX_SIZE];
+} __packed;
+/* firmware management backend firmware update response has no payload */
+
+/* firmware management backend firmware updated request */
+struct gb_fw_mgmt_backend_fw_updated_request {
+	__u8			request_id;
+	__u8			status;
+} __packed;
+/* firmware management backend firmware updated response has no payload */
+
+
+/* Component Authentication Protocol (CAP) */
+
+/* Request Types */
+#define GB_CAP_TYPE_GET_ENDPOINT_UID	0x01
+#define GB_CAP_TYPE_GET_IMS_CERTIFICATE	0x02
+#define GB_CAP_TYPE_AUTHENTICATE	0x03
+
+/* CAP get endpoint uid request has no payload */
+struct gb_cap_get_endpoint_uid_response {
+	__u8			uid[8];
+} __packed;
+
+/* CAP get endpoint ims certificate request/response */
+struct gb_cap_get_ims_certificate_request {
+	__le32			certificate_class;
+	__le32			certificate_id;
+} __packed;
+
+struct gb_cap_get_ims_certificate_response {
+	__u8			result_code;
+	__u8			certificate[0];
+} __packed;
+
+/* CAP authenticate request/response */
+struct gb_cap_authenticate_request {
+	__le32			auth_type;
+	__u8			uid[8];
+	__u8			challenge[32];
+} __packed;
+
+struct gb_cap_authenticate_response {
+	__u8			result_code;
+	__u8			response[64];
+	__u8			signature[0];
+} __packed;
 
 
 /* Bootrom Protocol */
@@ -315,10 +496,6 @@ struct gb_bootrom_get_vid_pid_response {
 
 /* Power Supply */
 
-/* Version of the Greybus power supply protocol we support */
-#define GB_POWER_SUPPLY_VERSION_MAJOR		0x00
-#define GB_POWER_SUPPLY_VERSION_MINOR		0x01
-
 /* Greybus power supply request types */
 #define GB_POWER_SUPPLY_TYPE_GET_SUPPLIES		0x02
 #define GB_POWER_SUPPLY_TYPE_GET_DESCRIPTION		0x03
@@ -327,7 +504,7 @@ struct gb_bootrom_get_vid_pid_response {
 #define GB_POWER_SUPPLY_TYPE_SET_PROPERTY		0x06
 #define GB_POWER_SUPPLY_TYPE_EVENT			0x07
 
-/* Should match up with battery technologies in linux/power_supply.h */
+/* Greybus power supply battery technologies types */
 #define GB_POWER_SUPPLY_TECH_UNKNOWN			0x0000
 #define GB_POWER_SUPPLY_TECH_NiMH			0x0001
 #define GB_POWER_SUPPLY_TECH_LION			0x0002
@@ -336,7 +513,7 @@ struct gb_bootrom_get_vid_pid_response {
 #define GB_POWER_SUPPLY_TECH_NiCd			0x0005
 #define GB_POWER_SUPPLY_TECH_LiMn			0x0006
 
-/* Should match up with power supply types in linux/power_supply.h */
+/* Greybus power supply types */
 #define GB_POWER_SUPPLY_UNKNOWN_TYPE			0x0000
 #define GB_POWER_SUPPLY_BATTERY_TYPE			0x0001
 #define GB_POWER_SUPPLY_UPS_TYPE			0x0002
@@ -346,7 +523,7 @@ struct gb_bootrom_get_vid_pid_response {
 #define GB_POWER_SUPPLY_USB_CDP_TYPE			0x0006
 #define GB_POWER_SUPPLY_USB_ACA_TYPE			0x0007
 
-/* Should match up with power supply health in linux/power_supply.h */
+/* Greybus power supply health values */
 #define GB_POWER_SUPPLY_HEALTH_UNKNOWN			0x0000
 #define GB_POWER_SUPPLY_HEALTH_GOOD			0x0001
 #define GB_POWER_SUPPLY_HEALTH_OVERHEAT			0x0002
@@ -357,12 +534,25 @@ struct gb_bootrom_get_vid_pid_response {
 #define GB_POWER_SUPPLY_HEALTH_WATCHDOG_TIMER_EXPIRE	0x0007
 #define GB_POWER_SUPPLY_HEALTH_SAFETY_TIMER_EXPIRE	0x0008
 
-/* Should match up with battery status in linux/power_supply.h */
-#define GB_POWER_SUPPLY_STATUS_UNKNOWN		0x0000
-#define GB_POWER_SUPPLY_STATUS_CHARGING		0x0001
-#define GB_POWER_SUPPLY_STATUS_DISCHARGING	0x0002
-#define GB_POWER_SUPPLY_STATUS_NOT_CHARGING	0x0003
-#define GB_POWER_SUPPLY_STATUS_FULL		0x0004
+/* Greybus power supply status values */
+#define GB_POWER_SUPPLY_STATUS_UNKNOWN			0x0000
+#define GB_POWER_SUPPLY_STATUS_CHARGING			0x0001
+#define GB_POWER_SUPPLY_STATUS_DISCHARGING		0x0002
+#define GB_POWER_SUPPLY_STATUS_NOT_CHARGING		0x0003
+#define GB_POWER_SUPPLY_STATUS_FULL			0x0004
+
+/* Greybus power supply capacity level values */
+#define GB_POWER_SUPPLY_CAPACITY_LEVEL_UNKNOWN		0x0000
+#define GB_POWER_SUPPLY_CAPACITY_LEVEL_CRITICAL		0x0001
+#define GB_POWER_SUPPLY_CAPACITY_LEVEL_LOW		0x0002
+#define GB_POWER_SUPPLY_CAPACITY_LEVEL_NORMAL		0x0003
+#define GB_POWER_SUPPLY_CAPACITY_LEVEL_HIGH		0x0004
+#define GB_POWER_SUPPLY_CAPACITY_LEVEL_FULL		0x0005
+
+/* Greybus power supply scope values */
+#define GB_POWER_SUPPLY_SCOPE_UNKNOWN			0x0000
+#define GB_POWER_SUPPLY_SCOPE_SYSTEM			0x0001
+#define GB_POWER_SUPPLY_SCOPE_DEVICE			0x0002
 
 struct gb_power_supply_get_supplies_response {
 	__u8	supplies_count;
@@ -480,10 +670,6 @@ struct gb_power_supply_event_request {
 
 /* HID */
 
-/* Version of the Greybus hid protocol we support */
-#define GB_HID_VERSION_MAJOR		0x00
-#define GB_HID_VERSION_MINOR		0x01
-
 /* Greybus HID operation types */
 #define GB_HID_TYPE_GET_DESC		0x02
 #define GB_HID_TYPE_GET_REPORT_DESC	0x03
@@ -530,10 +716,6 @@ struct gb_hid_input_report_request {
 
 /* I2C */
 
-/* Version of the Greybus i2c protocol we support */
-#define GB_I2C_VERSION_MAJOR		0x00
-#define GB_I2C_VERSION_MINOR		0x01
-
 /* Greybus i2c request types */
 #define GB_I2C_TYPE_FUNCTIONALITY	0x02
 #define GB_I2C_TYPE_TRANSFER		0x05
@@ -569,10 +751,6 @@ struct gb_i2c_transfer_response {
 
 
 /* GPIO */
-
-/* Version of the Greybus GPIO protocol we support */
-#define GB_GPIO_VERSION_MAJOR		0x00
-#define GB_GPIO_VERSION_MINOR		0x01
 
 /* Greybus GPIO request types */
 #define GB_GPIO_TYPE_LINE_COUNT		0x02
@@ -673,10 +851,6 @@ struct gb_gpio_irq_event_request {
 
 /* PWM */
 
-/* Version of the Greybus PWM protocol we support */
-#define GB_PWM_VERSION_MAJOR		0x00
-#define GB_PWM_VERSION_MINOR		0x01
-
 /* Greybus PWM operation types */
 #define GB_PWM_TYPE_PWM_COUNT		0x02
 #define GB_PWM_TYPE_ACTIVATE		0x03
@@ -719,10 +893,6 @@ struct gb_pwm_disable_request {
 } __packed;
 
 /* SPI */
-
-/* Version of the Greybus spi protocol we support */
-#define GB_SPI_VERSION_MAJOR		0x00
-#define GB_SPI_VERSION_MINOR		0x01
 
 /* Should match up with modes in linux/spi/spi.h */
 #define GB_SPI_MODE_CPHA		0x01		/* clock phase */
@@ -791,9 +961,10 @@ struct gb_spi_transfer {
 	__le16		delay_usecs;
 	__u8		cs_change;
 	__u8		bits_per_word;
-	__u8		rdwr;
+	__u8		xfer_flags;
 #define GB_SPI_XFER_READ	0x01
 #define GB_SPI_XFER_WRITE	0x02
+#define GB_SPI_XFER_INPROGRESS	0x04
 } __packed;
 
 struct gb_spi_transfer_request {
@@ -815,8 +986,6 @@ struct gb_spi_transfer_response {
 #define GB_SVC_TYPE_PROTOCOL_VERSION		0x01
 #define GB_SVC_TYPE_SVC_HELLO			0x02
 #define GB_SVC_TYPE_INTF_DEVICE_ID		0x03
-#define GB_SVC_TYPE_INTF_HOTPLUG		0x04
-#define GB_SVC_TYPE_INTF_HOT_UNPLUG		0x05
 #define GB_SVC_TYPE_INTF_RESET			0x06
 #define GB_SVC_TYPE_CONN_CREATE			0x07
 #define GB_SVC_TYPE_CONN_DESTROY		0x08
@@ -829,7 +998,6 @@ struct gb_spi_transfer_response {
 #define GB_SVC_TYPE_TIMESYNC_AUTHORITATIVE	0x0f
 #define GB_SVC_TYPE_INTF_SET_PWRM		0x10
 #define GB_SVC_TYPE_INTF_EJECT			0x11
-#define GB_SVC_TYPE_KEY_EVENT			0x12
 #define GB_SVC_TYPE_PING			0x13
 #define GB_SVC_TYPE_PWRMON_RAIL_COUNT_GET	0x14
 #define GB_SVC_TYPE_PWRMON_RAIL_NAMES_GET	0x15
@@ -847,7 +1015,27 @@ struct gb_spi_transfer_response {
 #define GB_SVC_TYPE_INTF_UNIPRO_ENABLE		0x25
 #define GB_SVC_TYPE_INTF_UNIPRO_DISABLE		0x26
 #define GB_SVC_TYPE_INTF_ACTIVATE		0x27
+#define GB_SVC_TYPE_INTF_RESUME			0x28
 #define GB_SVC_TYPE_INTF_MAILBOX_EVENT		0x29
+#define GB_SVC_TYPE_INTF_OOPS			0x2a
+
+/* Greybus SVC protocol status values */
+#define GB_SVC_OP_SUCCESS			0x00
+#define GB_SVC_OP_UNKNOWN_ERROR			0x01
+#define GB_SVC_INTF_NOT_DETECTED		0x02
+#define GB_SVC_INTF_NO_UPRO_LINK		0x03
+#define GB_SVC_INTF_UPRO_NOT_DOWN		0x04
+#define GB_SVC_INTF_UPRO_NOT_HIBERNATED		0x05
+#define GB_SVC_INTF_NO_V_SYS			0x06
+#define GB_SVC_INTF_V_CHG			0x07
+#define GB_SVC_INTF_WAKE_BUSY			0x08
+#define GB_SVC_INTF_NO_REFCLK			0x09
+#define GB_SVC_INTF_RELEASING			0x0a
+#define GB_SVC_INTF_NO_ORDER			0x0b
+#define GB_SVC_INTF_MBOX_SET			0x0c
+#define GB_SVC_INTF_BAD_MBOX			0x0d
+#define GB_SVC_INTF_OP_TIMEOUT			0x0e
+#define GB_SVC_PWRMON_OP_NOT_PRESENT		0x0f
 
 struct gb_svc_version_request {
 	__u8	major;
@@ -871,23 +1059,6 @@ struct gb_svc_intf_device_id_request {
 	__u8	device_id;
 } __packed;
 /* device id response has no payload */
-
-struct gb_svc_intf_hotplug_request {
-	__u8	intf_id;
-	struct {
-		__le32	ddbl1_mfr_id;
-		__le32	ddbl1_prod_id;
-		__le32	ara_vend_id;
-		__le32	ara_prod_id;
-		__le64	serial_number;
-	} data;
-} __packed;
-/* hotplug response has no payload */
-
-struct gb_svc_intf_hot_unplug_request {
-	__u8	intf_id;
-} __packed;
-/* hot unplug response has no payload */
 
 struct gb_svc_intf_reset_request {
 	__u8	intf_id;
@@ -945,6 +1116,7 @@ struct gb_svc_dme_peer_set_response {
 #define GB_INIT_UNTRUSTED_SPI_BOOT_FINISHED		0x04
 #define GB_INIT_BOOTROM_UNIPRO_BOOT_STARTED		0x06
 #define GB_INIT_BOOTROM_FALLBACK_UNIPRO_BOOT_STARTED	0x09
+#define GB_INIT_S2_LOADER_BOOT_STARTED			0x0D
 
 struct gb_svc_route_create_request {
 	__u8	intf1_id;
@@ -968,7 +1140,7 @@ struct gb_svc_intf_vsys_request {
 struct gb_svc_intf_vsys_response {
 	__u8	result_code;
 #define GB_SVC_INTF_VSYS_OK				0x00
-#define GB_SVC_INTF_VSYS_BUSY				0x01
+	/* 0x01 is reserved */
 #define GB_SVC_INTF_VSYS_FAIL				0x02
 } __packed;
 
@@ -980,7 +1152,7 @@ struct gb_svc_intf_refclk_request {
 struct gb_svc_intf_refclk_response {
 	__u8	result_code;
 #define GB_SVC_INTF_REFCLK_OK				0x00
-#define GB_SVC_INTF_REFCLK_BUSY				0x01
+	/* 0x01 is reserved */
 #define GB_SVC_INTF_REFCLK_FAIL				0x02
 } __packed;
 
@@ -992,7 +1164,7 @@ struct gb_svc_intf_unipro_request {
 struct gb_svc_intf_unipro_response {
 	__u8	result_code;
 #define GB_SVC_INTF_UNIPRO_OK				0x00
-#define GB_SVC_INTF_UNIPRO_BUSY				0x01
+	/* 0x01 is reserved */
 #define GB_SVC_INTF_UNIPRO_FAIL				0x02
 #define GB_SVC_INTF_UNIPRO_NOT_OFF			0x03
 } __packed;
@@ -1032,6 +1204,13 @@ struct gb_svc_timesync_ping_response {
 #define GB_SVC_UNIPRO_HIBERNATE_MODE		0x11
 #define GB_SVC_UNIPRO_OFF_MODE			0x12
 
+#define GB_SVC_SMALL_AMPLITUDE          0x01
+#define GB_SVC_LARGE_AMPLITUDE          0x02
+
+#define GB_SVC_NO_DE_EMPHASIS           0x00
+#define GB_SVC_SMALL_DE_EMPHASIS        0x01
+#define GB_SVC_LARGE_DE_EMPHASIS        0x02
+
 #define GB_SVC_PWRM_RXTERMINATION		0x01
 #define GB_SVC_PWRM_TXTERMINATION		0x02
 #define GB_SVC_PWRM_LINE_RESET			0x04
@@ -1042,21 +1221,42 @@ struct gb_svc_timesync_ping_response {
 #define GB_SVC_UNIPRO_HS_SERIES_A		0x01
 #define GB_SVC_UNIPRO_HS_SERIES_B		0x02
 
+#define GB_SVC_SETPWRM_PWR_OK           0x00
+#define GB_SVC_SETPWRM_PWR_LOCAL        0x01
+#define GB_SVC_SETPWRM_PWR_REMOTE       0x02
+#define GB_SVC_SETPWRM_PWR_BUSY         0x03
+#define GB_SVC_SETPWRM_PWR_ERROR_CAP    0x04
+#define GB_SVC_SETPWRM_PWR_FATAL_ERROR  0x05
+
+struct gb_svc_l2_timer_cfg {
+	__le16 tsb_fc0_protection_timeout;
+	__le16 tsb_tc0_replay_timeout;
+	__le16 tsb_afc0_req_timeout;
+	__le16 tsb_fc1_protection_timeout;
+	__le16 tsb_tc1_replay_timeout;
+	__le16 tsb_afc1_req_timeout;
+	__le16 reserved_for_tc2[3];
+	__le16 reserved_for_tc3[3];
+} __packed;
+
 struct gb_svc_intf_set_pwrm_request {
 	__u8	intf_id;
 	__u8	hs_series;
 	__u8	tx_mode;
 	__u8	tx_gear;
 	__u8	tx_nlanes;
+	__u8	tx_amplitude;
+	__u8	tx_hs_equalizer;
 	__u8	rx_mode;
 	__u8	rx_gear;
 	__u8	rx_nlanes;
 	__u8	flags;
 	__le32	quirks;
+	struct gb_svc_l2_timer_cfg local_l2timerdata, remote_l2timerdata;
 } __packed;
 
 struct gb_svc_intf_set_pwrm_response {
-	__le16	result_code;
+	__u8	result_code;
 } __packed;
 
 struct gb_svc_key_event_request {
@@ -1077,6 +1277,7 @@ struct gb_svc_pwrmon_rail_count_get_response {
 #define GB_SVC_PWRMON_RAIL_NAME_BUFSIZE		32
 
 struct gb_svc_pwrmon_rail_names_get_response {
+	__u8	status;
 	__u8	name[0][GB_SVC_PWRMON_RAIL_NAME_BUFSIZE];
 } __packed;
 
@@ -1133,7 +1334,16 @@ struct gb_svc_intf_activate_request {
 #define GB_SVC_INTF_TYPE_GREYBUS		0x03
 
 struct gb_svc_intf_activate_response {
+	__u8	status;
 	__u8	intf_type;
+} __packed;
+
+struct gb_svc_intf_resume_request {
+	__u8	intf_id;
+} __packed;
+
+struct gb_svc_intf_resume_response {
+	__u8	status;
 } __packed;
 
 #define GB_SVC_INTF_MAILBOX_NONE		0x00
@@ -1147,12 +1357,14 @@ struct gb_svc_intf_mailbox_event_request {
 } __packed;
 /* intf_mailbox_event response has no payload */
 
+struct gb_svc_intf_oops_request {
+	__u8	intf_id;
+	__u8	reason;
+} __packed;
+/* intf_oops response has no payload */
+
 
 /* RAW */
-
-/* Version of the Greybus raw protocol we support */
-#define	GB_RAW_VERSION_MAJOR			0x00
-#define	GB_RAW_VERSION_MINOR			0x01
 
 /* Greybus raw request types */
 #define	GB_RAW_TYPE_SEND			0x02
@@ -1165,10 +1377,6 @@ struct gb_raw_send_request {
 
 /* UART */
 
-/* Version of the Greybus UART protocol we support */
-#define GB_UART_VERSION_MAJOR		0x00
-#define GB_UART_VERSION_MINOR		0x01
-
 /* Greybus UART operation types */
 #define GB_UART_TYPE_SEND_DATA			0x02
 #define GB_UART_TYPE_RECEIVE_DATA		0x03	/* Unsolicited data */
@@ -1176,6 +1384,8 @@ struct gb_raw_send_request {
 #define GB_UART_TYPE_SET_CONTROL_LINE_STATE	0x05
 #define GB_UART_TYPE_SEND_BREAK			0x06
 #define GB_UART_TYPE_SERIAL_STATE		0x07	/* Unsolicited data */
+#define GB_UART_TYPE_RECEIVE_CREDITS		0x08
+#define GB_UART_TYPE_FLUSH_FIFOS		0x09
 
 /* Represents data from AP -> Module */
 struct gb_uart_send_data_request {
@@ -1196,6 +1406,10 @@ struct gb_uart_recv_data_request {
 	__u8	data[0];
 } __packed;
 
+struct gb_uart_receive_credits_request {
+	__le16  count;
+} __packed;
+
 struct gb_uart_set_line_coding_request {
 	__le32	rate;
 	__u8	format;
@@ -1211,6 +1425,9 @@ struct gb_uart_set_line_coding_request {
 #define GB_SERIAL_SPACE_PARITY			4
 
 	__u8	data_bits;
+
+	__u8	flow_control;
+#define GB_SERIAL_AUTO_RTSCTS_EN		0x1
 } __packed;
 
 /* output control lines */
@@ -1234,11 +1451,13 @@ struct gb_uart_serial_state_request {
 	__u8	control;
 } __packed;
 
-/* Loopback */
+struct gb_uart_serial_flush_request {
+	__u8    flags;
+#define GB_SERIAL_FLAG_FLUSH_TRANSMITTER	0x01
+#define GB_SERIAL_FLAG_FLUSH_RECEIVER		0x02
+} __packed;
 
-/* Version of the Greybus loopback protocol we support */
-#define GB_LOOPBACK_VERSION_MAJOR		0x00
-#define GB_LOOPBACK_VERSION_MINOR		0x01
+/* Loopback */
 
 /* Greybus loopback request types */
 #define GB_LOOPBACK_TYPE_PING			0x02
@@ -1264,10 +1483,6 @@ struct gb_loopback_transfer_response {
 } __packed;
 
 /* SDIO */
-/* Version of the Greybus sdio protocol we support */
-#define GB_SDIO_VERSION_MAJOR		0x00
-#define GB_SDIO_VERSION_MINOR		0x01
-
 /* Greybus SDIO operation types */
 #define GB_SDIO_TYPE_GET_CAPABILITIES		0x02
 #define GB_SDIO_TYPE_SET_IOS			0x03
@@ -1302,10 +1517,10 @@ struct gb_sdio_get_caps_response {
 
 	/* see possible values below at vdd */
 	__le32 ocr;
-	__le16 max_blk_count;
-	__le16 max_blk_size;
 	__le32 f_min;
 	__le32 f_max;
+	__le16 max_blk_count;
+	__le16 max_blk_size;
 } __packed;
 
 /* set ios request: response has no payload */
@@ -1424,9 +1639,6 @@ struct gb_sdio_event_request {
 
 /* Camera */
 
-#define GB_CAMERA_VERSION_MAJOR			0x00
-#define GB_CAMERA_VERSION_MINOR			0x01
-
 /* Greybus Camera request types */
 #define GB_CAMERA_TYPE_CAPABILITIES		0x02
 #define GB_CAMERA_TYPE_CONFIGURE_STREAMS	0x03
@@ -1460,20 +1672,19 @@ struct gb_camera_stream_config_response {
 	__le16 format;
 	__u8 virtual_channel;
 	__u8 data_type[2];
-	__u8 padding[3];
+	__le16 max_pkt_size;
+	__u8 padding;
 	__le32 max_size;
 } __packed;
 
 struct gb_camera_configure_streams_response {
 	__u8 num_streams;
-	__u8 flags;
 #define GB_CAMERA_CONFIGURE_STREAMS_ADJUSTED	0x01
-	__u8 num_lanes;
-	__u8 padding;
-	__le32 bus_freq;
-	__le32 lines_per_second;
+	__u8 flags;
+	__u8 padding[2];
+	__le32 data_rate;
 	struct gb_camera_stream_config_response config[0];
-} __packed;
+};
 
 /* Greybus Camera Capture request payload - response has no payload */
 struct gb_camera_capture_request {
@@ -1499,9 +1710,6 @@ struct gb_camera_metadata_request {
 } __packed;
 
 /* Lights */
-
-#define GB_LIGHTS_VERSION_MAJOR 0x00
-#define GB_LIGHTS_VERSION_MINOR 0x01
 
 /* Greybus Lights request types */
 #define GB_LIGHTS_TYPE_GET_LIGHTS		0x02
@@ -1674,11 +1882,6 @@ struct gb_lights_get_flash_fault_response {
 
 /* Audio */
 
-/* Version of the Greybus audio protocol we support */
-#define GB_AUDIO_VERSION_MAJOR			0x00
-#define GB_AUDIO_VERSION_MINOR			0x01
-
-#define GB_AUDIO_TYPE_PROTOCOL_VERSION		0x01
 #define GB_AUDIO_TYPE_GET_TOPOLOGY_SIZE		0x02
 #define GB_AUDIO_TYPE_GET_TOPOLOGY		0x03
 #define GB_AUDIO_TYPE_GET_CONTROL		0x04
@@ -1688,11 +1891,11 @@ struct gb_lights_get_flash_fault_response {
 #define GB_AUDIO_TYPE_GET_PCM			0x08
 #define GB_AUDIO_TYPE_SET_PCM			0x09
 #define GB_AUDIO_TYPE_SET_TX_DATA_SIZE		0x0a
-#define GB_AUDIO_TYPE_GET_TX_DELAY		0x0b
+						/* 0x0b unused */
 #define GB_AUDIO_TYPE_ACTIVATE_TX		0x0c
 #define GB_AUDIO_TYPE_DEACTIVATE_TX		0x0d
 #define GB_AUDIO_TYPE_SET_RX_DATA_SIZE		0x0e
-#define GB_AUDIO_TYPE_GET_RX_DELAY		0x0f
+						/* 0x0f unused */
 #define GB_AUDIO_TYPE_ACTIVATE_RX		0x10
 #define GB_AUDIO_TYPE_DEACTIVATE_RX		0x11
 #define GB_AUDIO_TYPE_JACK_EVENT		0x12
@@ -1826,6 +2029,29 @@ struct gb_lights_get_flash_fault_response {
 
 #define GB_AUDIO_INVALID_INDEX			0xff
 
+/* enum snd_jack_types */
+#define GB_AUDIO_JACK_HEADPHONE			0x0000001
+#define GB_AUDIO_JACK_MICROPHONE		0x0000002
+#define GB_AUDIO_JACK_HEADSET			(GB_AUDIO_JACK_HEADPHONE | \
+						 GB_AUDIO_JACK_MICROPHONE)
+#define GB_AUDIO_JACK_LINEOUT			0x0000004
+#define GB_AUDIO_JACK_MECHANICAL		0x0000008
+#define GB_AUDIO_JACK_VIDEOOUT			0x0000010
+#define GB_AUDIO_JACK_AVOUT			(GB_AUDIO_JACK_LINEOUT | \
+						 GB_AUDIO_JACK_VIDEOOUT)
+#define GB_AUDIO_JACK_LINEIN			0x0000020
+#define GB_AUDIO_JACK_OC_HPHL			0x0000040
+#define GB_AUDIO_JACK_OC_HPHR			0x0000080
+#define GB_AUDIO_JACK_MICROPHONE2		0x0000200
+#define GB_AUDIO_JACK_ANC_HEADPHONE		(GB_AUDIO_JACK_HEADPHONE | \
+						 GB_AUDIO_JACK_MICROPHONE | \
+						 GB_AUDIO_JACK_MICROPHONE2)
+/* Kept separate from switches to facilitate implementation */
+#define GB_AUDIO_JACK_BTN_0			0x4000000
+#define GB_AUDIO_JACK_BTN_1			0x2000000
+#define GB_AUDIO_JACK_BTN_2			0x1000000
+#define GB_AUDIO_JACK_BTN_3			0x0800000
+
 struct gb_audio_pcm {
 	__u8	stream_name[GB_AUDIO_PCM_NAME_MAX];
 	__le32	formats;	/* GB_AUDIO_PCM_FMT_* */
@@ -1912,10 +2138,11 @@ struct gb_audio_topology {
 	__u8	num_controls;
 	__u8	num_widgets;
 	__u8	num_routes;
-	__u32	size_dais;
-	__u32	size_controls;
-	__u32	size_widgets;
-	__u32	size_routes;
+	__le32	size_dais;
+	__le32	size_controls;
+	__le32	size_widgets;
+	__le32	size_routes;
+	__le32	jack_type;
 	/*
 	 * struct gb_audio_dai		dai[num_dais];
 	 * struct gb_audio_control	controls[num_controls];
@@ -1980,14 +2207,6 @@ struct gb_audio_set_tx_data_size_request {
 	__le16	size;
 } __packed;
 
-struct gb_audio_get_tx_delay_request {
-	__le16	data_cport;
-} __packed;
-
-struct gb_audio_get_tx_delay_response {
-	__le32	delay;
-} __packed;
-
 struct gb_audio_activate_tx_request {
 	__le16	data_cport;
 } __packed;
@@ -1999,14 +2218,6 @@ struct gb_audio_deactivate_tx_request {
 struct gb_audio_set_rx_data_size_request {
 	__le16	data_cport;
 	__le16	size;
-} __packed;
-
-struct gb_audio_get_rx_delay_request {
-	__le16	data_cport;
-} __packed;
-
-struct gb_audio_get_rx_delay_response {
-	__le32	delay;
 } __packed;
 
 struct gb_audio_activate_rx_request {
@@ -2037,6 +2248,20 @@ struct gb_audio_streaming_event_request {
 struct gb_audio_send_data_request {
 	__le64	timestamp;
 	__u8	data[0];
+} __packed;
+
+
+/* Log */
+
+/* operations */
+#define GB_LOG_TYPE_SEND_LOG	0x02
+
+/* length */
+#define GB_LOG_MAX_LEN		1024
+
+struct gb_log_send_log_request {
+	__le16	len;
+	__u8    msg[0];
 } __packed;
 
 #endif /* __GREYBUS_PROTOCOLS_H */

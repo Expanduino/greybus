@@ -6,26 +6,19 @@ greybus-y :=	core.o		\
 		interface.o	\
 		bundle.o	\
 		connection.o	\
-		protocol.o	\
 		control.o	\
 		svc.o		\
 		svc_watchdog.o	\
-		bootrom.o	\
 		operation.o	\
-		legacy.o
+		timesync.o	\
+		timesync_platform.o
 
-gb-phy-y :=	gpbridge.o	\
-		sdio.o	\
-		uart.o	\
-		pwm.o	\
-		gpio.o	\
-		i2c.o	\
-		spi.o	\
-		usb.o
+gb-gbphy-y := gbphy.o
 
 # Prefix all modules with gb-
 gb-vibrator-y := vibrator.o
 gb-power-supply-y := power_supply.o
+gb-log-y := log.o
 gb-loopback-y := loopback.o
 gb-light-y := light.o
 gb-raw-y := raw.o
@@ -39,13 +32,23 @@ gb-audio-gb-y := audio_gb.o
 gb-audio-apbridgea-y := audio_apbridgea.o
 gb-audio-manager-y += audio_manager.o
 gb-audio-manager-y += audio_manager_module.o
+gb-bootrom-y := bootrom.o
 gb-camera-y := camera.o
-gb-firmware-y := fw-core.o fw-download.o
+gb-firmware-y := fw-core.o fw-download.o fw-management.o authentication.o
+gb-spilib-y := spilib.o
+gb-sdio-y := sdio.o
+gb-uart-y := uart.o
+gb-pwm-y := pwm.o
+gb-gpio-y := gpio.o
+gb-i2c-y := i2c.o
+gb-usb-y := usb.o
+gb-spi-y := spi.o
 
 obj-m += greybus.o
-obj-m += gb-phy.o
+obj-m += gb-gbphy.o
 obj-m += gb-vibrator.o
 obj-m += gb-power-supply.o
+obj-m += gb-log.o
 obj-m += gb-loopback.o
 obj-m += gb-light.o
 obj-m += gb-hid.o
@@ -63,7 +66,16 @@ endif
 obj-m += gb-audio-gb.o
 obj-m += gb-audio-apbridgea.o
 obj-m += gb-audio-manager.o
+obj-m += gb-bootrom.o
 obj-m += gb-firmware.o
+obj-m += gb-spilib.o
+obj-m += gb-sdio.o
+obj-m += gb-uart.o
+obj-m += gb-pwm.o
+obj-m += gb-gpio.o
+obj-m += gb-i2c.o
+obj-m += gb-usb.o
+obj-m += gb-spi.o
 
 KERNELVER		?= $(shell uname -r)
 KERNELDIR 		?= /lib/modules/$(KERNELVER)/build

@@ -47,6 +47,8 @@ enum greybus_protocol {
 	GREYBUS_PROTOCOL_CAMERA_DATA	= 0x16,
 	GREYBUS_PROTOCOL_FW_DOWNLOAD	= 0x17,
 	GREYBUS_PROTOCOL_FW_MANAGEMENT	= 0x18,
+	GREYBUS_PROTOCOL_AUTHENTICATION	= 0x19,
+	GREYBUS_PROTOCOL_LOG		= 0x1a,
 		/* ... */
 	GREYBUS_PROTOCOL_RAW		= 0xfe,
 	GREYBUS_PROTOCOL_VENDOR		= 0xff,
@@ -55,16 +57,16 @@ enum greybus_protocol {
 enum greybus_class_type {
 	GREYBUS_CLASS_CONTROL		= 0x00,
 	/* 0x01 is unused */
-	GREYBUS_CLASS_GPIO		= 0x02,
-	GREYBUS_CLASS_I2C		= 0x03,
-	GREYBUS_CLASS_UART		= 0x04,
+	/* 0x02 is unused */
+	/* 0x03 is unused */
+	/* 0x04 is unused */
 	GREYBUS_CLASS_HID		= 0x05,
-	GREYBUS_CLASS_USB		= 0x06,
-	GREYBUS_CLASS_SDIO		= 0x07,
+	/* 0x06 is unused */
+	/* 0x07 is unused */
 	GREYBUS_CLASS_POWER_SUPPLY	= 0x08,
-	GREYBUS_CLASS_PWM		= 0x09,
+	/* 0x09 is unused */
 	GREYBUS_CLASS_BRIDGED_PHY	= 0x0a,
-	GREYBUS_CLASS_SPI		= 0x0b,
+	/* 0x0b is unused */
 	GREYBUS_CLASS_DISPLAY		= 0x0c,
 	GREYBUS_CLASS_CAMERA		= 0x0d,
 	GREYBUS_CLASS_SENSOR		= 0x0e,
@@ -76,9 +78,14 @@ enum greybus_class_type {
 	/* 0x14 is unused */
 	GREYBUS_CLASS_BOOTROM		= 0x15,
 	GREYBUS_CLASS_FW_MANAGEMENT	= 0x16,
+	GREYBUS_CLASS_LOG		= 0x17,
 		/* ... */
 	GREYBUS_CLASS_RAW		= 0xfe,
 	GREYBUS_CLASS_VENDOR		= 0xff,
+};
+
+enum {
+	GREYBUS_INTERFACE_FEATURE_TIMESYNC = BIT(0),
 };
 
 /*
@@ -99,7 +106,8 @@ struct greybus_descriptor_string {
 struct greybus_descriptor_interface {
 	__u8	vendor_stringid;
 	__u8	product_stringid;
-	__u8	pad[2];
+	__u8	features;
+	__u8	pad;
 } __packed;
 
 /*

@@ -12,17 +12,31 @@
 #include <linux/mutex.h>
 #include <linux/workqueue.h>
 
-#include "bootrom.h"
 #include "greybus.h"
+#include "firmware.h"
 
 /* Timeout, in jiffies, within which the next request must be received */
-#define NEXT_REQ_TIMEOUT_J	msecs_to_jiffies(1000)
+#define NEXT_REQ_TIMEOUT_MS	1000
+
+/*
+ * FIXME: Reduce this timeout once svc core handles parallel processing of
+ * events from the SVC, which are handled sequentially today.
+ */
+#define MODE_SWITCH_TIMEOUT_MS	10000
+
+enum next_request_type {
+	NEXT_REQ_FIRMWARE_SIZE,
+	NEXT_REQ_GET_FIRMWARE,
+	NEXT_REQ_READY_TO_BOOT,
+	NEXT_REQ_MODE_SWITCH,
+};
 
 struct gb_bootrom {
 	struct gb_connection	*connection;
 	const struct firmware	*fw;
 	u8			protocol_major;
 	u8			protocol_minor;
+	enum next_request_type	next_request;
 	struct delayed_work	dwork;
 	struct mutex		mutex; /* Protects bootrom->fw */
 };
@@ -41,14 +55,46 @@ static void gb_bootrom_timedout(struct work_struct *work)
 	struct delayed_work *dwork = to_delayed_work(work);
 	struct gb_bootrom *bootrom = container_of(dwork, struct gb_bootrom, dwork);
 	struct device *dev = &bootrom->connection->bundle->dev;
+	const char *reason;
 
-	dev_err(dev, "Timed out waiting for request from the Module\n");
+	switch (bootrom->next_request) {
+	case NEXT_REQ_FIRMWARE_SIZE:
+		reason = "Firmware Size Request";
+		break;
+	case NEXT_REQ_GET_FIRMWARE:
+		reason = "Get Firmware Request";
+		break;
+	case NEXT_REQ_READY_TO_BOOT:
+		reason = "Ready to Boot Request";
+		break;
+	case NEXT_REQ_MODE_SWITCH:
+		reason = "Interface Mode Switch";
+		break;
+	default:
+		reason = NULL;
+		dev_err(dev, "Invalid next-request: %u", bootrom->next_request);
+		break;
+	}
+
+	dev_err(dev, "Timed out waiting for %s from the Module\n", reason);
 
 	mutex_lock(&bootrom->mutex);
 	free_firmware(bootrom);
 	mutex_unlock(&bootrom->mutex);
 
 	/* TODO: Power-off Module ? */
+}
+
+static void gb_bootrom_set_timeout(struct gb_bootrom *bootrom,
+			enum next_request_type next, unsigned long timeout)
+{
+	bootrom->next_request = next;
+	schedule_delayed_work(&bootrom->dwork, msecs_to_jiffies(timeout));
+}
+
+static void gb_bootrom_cancel_timeout(struct gb_bootrom *bootrom)
+{
+	cancel_delayed_work_sync(&bootrom->dwork);
 }
 
 /*
@@ -68,7 +114,7 @@ static void bootrom_es2_fixup_vid_pid(struct gb_bootrom *bootrom)
 	struct gb_interface *intf = connection->bundle->intf;
 	int ret;
 
-	if (!(intf->quirks & GB_INTERFACE_QUIRK_NO_ARA_IDS))
+	if (!(intf->quirks & GB_INTERFACE_QUIRK_NO_GMP_IDS))
 		return;
 
 	ret = gb_operation_sync(connection, GB_BOOTROM_TYPE_GET_VID_PID,
@@ -94,15 +140,22 @@ static void bootrom_es2_fixup_vid_pid(struct gb_bootrom *bootrom)
 }
 
 /* This returns path of the firmware blob on the disk */
-static int download_firmware(struct gb_bootrom *bootrom, u8 stage)
+static int find_firmware(struct gb_bootrom *bootrom, u8 stage)
 {
 	struct gb_connection *connection = bootrom->connection;
 	struct gb_interface *intf = connection->bundle->intf;
-	char firmware_name[48];
+	char firmware_name[49];
 	int rc;
 
 	/* Already have a firmware, free it */
 	free_firmware(bootrom);
+
+	/* Bootrom protocol is only supported for loading Stage 2 firmware */
+	if (stage != 2) {
+		dev_err(&connection->bundle->dev, "Invalid boot stage: %u\n",
+			stage);
+		return -EINVAL;
+	}
 
 	/*
 	 * Create firmware name
@@ -110,9 +163,9 @@ static int download_firmware(struct gb_bootrom *bootrom, u8 stage)
 	 * XXX Name it properly..
 	 */
 	snprintf(firmware_name, sizeof(firmware_name),
-		 "ara_%08x_%08x_%08x_%08x_%02x.tftf",
+		 FW_NAME_PREFIX "%08x_%08x_%08x_%08x_s2l.tftf",
 		 intf->ddbl1_manufacturer_id, intf->ddbl1_product_id,
-		 intf->vendor_id, intf->product_id, stage);
+		 intf->vendor_id, intf->product_id);
 
 	// FIXME:
 	// Turn to dev_dbg later after everyone has valid bootloaders with good
@@ -123,10 +176,11 @@ static int download_firmware(struct gb_bootrom *bootrom, u8 stage)
 
 	rc = request_firmware(&bootrom->fw, firmware_name,
 		&connection->bundle->dev);
-	if (rc)
+	if (rc) {
 		dev_err(&connection->bundle->dev,
-			"Firmware request for %s has failed : %d",
-			firmware_name, rc);
+			"failed to find %s firmware (%d)\n", firmware_name, rc);
+	}
+
 	return rc;
 }
 
@@ -139,7 +193,7 @@ static int gb_bootrom_firmware_size_request(struct gb_operation *op)
 	int ret;
 
 	/* Disable timeouts */
-	cancel_delayed_work_sync(&bootrom->dwork);
+	gb_bootrom_cancel_timeout(bootrom);
 
 	if (op->request->payload_size != sizeof(*size_request)) {
 		dev_err(dev, "%s: illegal size of firmware size request (%zu != %zu)\n",
@@ -151,12 +205,9 @@ static int gb_bootrom_firmware_size_request(struct gb_operation *op)
 
 	mutex_lock(&bootrom->mutex);
 
-	ret = download_firmware(bootrom, size_request->stage);
-	if (ret) {
-		dev_err(dev, "%s: failed to download firmware (%d)\n", __func__,
-			ret);
+	ret = find_firmware(bootrom, size_request->stage);
+	if (ret)
 		goto unlock;
-	}
 
 	if (!gb_operation_response_alloc(op, sizeof(*size_response),
 					 GFP_KERNEL)) {
@@ -175,8 +226,11 @@ unlock:
 	mutex_unlock(&bootrom->mutex);
 
 queue_work:
-	/* Refresh timeout */
-	schedule_delayed_work(&bootrom->dwork, NEXT_REQ_TIMEOUT_J);
+	if (!ret) {
+		/* Refresh timeout */
+		gb_bootrom_set_timeout(bootrom, NEXT_REQ_GET_FIRMWARE,
+				       NEXT_REQ_TIMEOUT_MS);
+	}
 
 	return ret;
 }
@@ -189,10 +243,11 @@ static int gb_bootrom_get_firmware(struct gb_operation *op)
 	struct gb_bootrom_get_firmware_response *firmware_response;
 	struct device *dev = &op->connection->bundle->dev;
 	unsigned int offset, size;
+	enum next_request_type next_request;
 	int ret = 0;
 
 	/* Disable timeouts */
-	cancel_delayed_work_sync(&bootrom->dwork);
+	gb_bootrom_cancel_timeout(bootrom);
 
 	if (op->request->payload_size != sizeof(*firmware_request)) {
 		dev_err(dev, "%s: Illegal size of get firmware request (%zu %zu)\n",
@@ -240,7 +295,12 @@ unlock:
 
 queue_work:
 	/* Refresh timeout */
-	schedule_delayed_work(&bootrom->dwork, NEXT_REQ_TIMEOUT_J);
+	if (!ret && (offset + size == fw->size))
+		next_request = NEXT_REQ_READY_TO_BOOT;
+	else
+		next_request = NEXT_REQ_GET_FIRMWARE;
+
+	gb_bootrom_set_timeout(bootrom, next_request, NEXT_REQ_TIMEOUT_MS);
 
 	return ret;
 }
@@ -255,7 +315,7 @@ static int gb_bootrom_ready_to_boot(struct gb_operation *op)
 	int ret = 0;
 
 	/* Disable timeouts */
-	cancel_delayed_work_sync(&bootrom->dwork);
+	gb_bootrom_cancel_timeout(bootrom);
 
 	if (op->request->payload_size != sizeof(*rtb_request)) {
 		dev_err(dev, "%s: Illegal size of ready to boot request (%zu %zu)\n",
@@ -285,7 +345,8 @@ queue_work:
 	 * send a new hotplug request, which shall get rid of the bootrom
 	 * connection. As that can take some time, increase the timeout a bit.
 	 */
-	schedule_delayed_work(&bootrom->dwork, 5 * NEXT_REQ_TIMEOUT_J);
+	gb_bootrom_set_timeout(bootrom, NEXT_REQ_MODE_SWITCH,
+			       MODE_SWITCH_TIMEOUT_MS);
 
 	return ret;
 }
@@ -394,22 +455,25 @@ static int gb_bootrom_probe(struct gb_bundle *bundle,
 	if (ret)
 		goto err_connection_disable;
 
+	/* Refresh timeout */
+	gb_bootrom_set_timeout(bootrom, NEXT_REQ_FIRMWARE_SIZE,
+			       NEXT_REQ_TIMEOUT_MS);
+
 	/* Tell bootrom we're ready. */
 	ret = gb_operation_sync(connection, GB_BOOTROM_TYPE_AP_READY, NULL, 0,
 				NULL, 0);
 	if (ret) {
 		dev_err(&connection->bundle->dev,
 				"failed to send AP READY: %d\n", ret);
-		goto err_connection_disable;
+		goto err_cancel_timeout;
 	}
-
-	/* Refresh timeout */
-	schedule_delayed_work(&bootrom->dwork, NEXT_REQ_TIMEOUT_J);
 
 	dev_dbg(&bundle->dev, "AP_READY sent\n");
 
 	return 0;
 
+err_cancel_timeout:
+	gb_bootrom_cancel_timeout(bootrom);
 err_connection_disable:
 	gb_connection_disable(connection);
 err_connection_destroy:
@@ -429,7 +493,7 @@ static void gb_bootrom_disconnect(struct gb_bundle *bundle)
 	gb_connection_disable(bootrom->connection);
 
 	/* Disable timeouts */
-	cancel_delayed_work_sync(&bootrom->dwork);
+	gb_bootrom_cancel_timeout(bootrom);
 
 	/*
 	 * Release firmware:
@@ -455,12 +519,6 @@ static struct greybus_driver gb_bootrom_driver = {
 	.id_table	= gb_bootrom_id_table,
 };
 
-int gb_bootrom_init(void)
-{
-	return greybus_register(&gb_bootrom_driver);
-}
+module_greybus_driver(gb_bootrom_driver);
 
-void gb_bootrom_exit(void)
-{
-	greybus_deregister(&gb_bootrom_driver);
-}
+MODULE_LICENSE("GPL v2");

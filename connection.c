@@ -10,6 +10,10 @@
 #include <linux/workqueue.h>
 
 #include "greybus.h"
+#include "greybus_trace.h"
+
+
+#define GB_CONNECTION_CPORT_QUIESCE_TIMEOUT	1000
 
 
 static void gb_connection_kref_release(struct kref *kref);
@@ -20,8 +24,7 @@ static DEFINE_MUTEX(gb_connection_mutex);
 
 
 /* Caller holds gb_connection_mutex. */
-static struct gb_connection *
-gb_connection_intf_find(struct gb_interface *intf, u16 cport_id)
+static bool gb_connection_cport_in_use(struct gb_interface *intf, u16 cport_id)
 {
 	struct gb_host_device *hd = intf->hd;
 	struct gb_connection *connection;
@@ -29,19 +32,23 @@ gb_connection_intf_find(struct gb_interface *intf, u16 cport_id)
 	list_for_each_entry(connection, &hd->connections, hd_links) {
 		if (connection->intf == intf &&
 				connection->intf_cport_id == cport_id)
-			return connection;
+			return true;
 	}
 
-	return NULL;
+	return false;
 }
 
 static void gb_connection_get(struct gb_connection *connection)
 {
 	kref_get(&connection->kref);
+
+	trace_gb_connection_get(connection);
 }
 
 static void gb_connection_put(struct gb_connection *connection)
 {
+	trace_gb_connection_put(connection);
+
 	kref_put(&connection->kref, gb_connection_kref_release);
 }
 
@@ -76,6 +83,8 @@ void greybus_data_rcvd(struct gb_host_device *hd, u16 cport_id,
 {
 	struct gb_connection *connection;
 
+	trace_gb_hd_in(hd);
+
 	connection = gb_connection_hd_find(hd, cport_id);
 	if (!connection) {
 		dev_err(&hd->dev,
@@ -92,6 +101,8 @@ static void gb_connection_kref_release(struct kref *kref)
 	struct gb_connection *connection;
 
 	connection = container_of(kref, struct gb_connection, kref);
+
+	trace_gb_connection_release(connection);
 
 	kfree(connection);
 }
@@ -142,38 +153,27 @@ _gb_connection_create(struct gb_host_device *hd, int hd_cport_id,
 				unsigned long flags)
 {
 	struct gb_connection *connection;
-	struct ida *id_map = &hd->cport_id_map;
-	int ida_start, ida_end;
 	int ret;
-
-	if (hd_cport_id < 0) {
-		ida_start = 0;
-		ida_end = hd->num_cports;
-	} else if (hd_cport_id < hd->num_cports) {
-		ida_start = hd_cport_id;
-		ida_end = hd_cport_id + 1;
-	} else {
-		dev_err(&hd->dev, "cport %d not available\n", hd_cport_id);
-		return ERR_PTR(-EINVAL);
-	}
 
 	mutex_lock(&gb_connection_mutex);
 
-	if (intf && gb_connection_intf_find(intf, cport_id)) {
+	if (intf && gb_connection_cport_in_use(intf, cport_id)) {
 		dev_err(&intf->dev, "cport %u already in use\n", cport_id);
 		ret = -EBUSY;
 		goto err_unlock;
 	}
 
-	ret = ida_simple_get(id_map, ida_start, ida_end, GFP_KERNEL);
-	if (ret < 0)
+	ret = gb_hd_cport_allocate(hd, hd_cport_id, flags);
+	if (ret < 0) {
+		dev_err(&hd->dev, "failed to allocate cport: %d\n", ret);
 		goto err_unlock;
+	}
 	hd_cport_id = ret;
 
 	connection = kzalloc(sizeof(*connection), GFP_KERNEL);
 	if (!connection) {
 		ret = -ENOMEM;
-		goto err_remove_ida;
+		goto err_hd_cport_release;
 	}
 
 	connection->hd_cport_id = hd_cport_id;
@@ -183,6 +183,8 @@ _gb_connection_create(struct gb_host_device *hd, int hd_cport_id,
 	connection->bundle = bundle;
 	connection->handler = handler;
 	connection->flags = flags;
+	if (intf && (intf->quirks & GB_INTERFACE_QUIRK_NO_CPORT_FEATURES))
+		connection->flags |= GB_CONNECTION_FLAG_NO_FLOWCTRL;
 	connection->state = GB_CONNECTION_STATE_DISABLED;
 
 	atomic_set(&connection->op_cycle, 0);
@@ -213,12 +215,14 @@ _gb_connection_create(struct gb_host_device *hd, int hd_cport_id,
 
 	mutex_unlock(&gb_connection_mutex);
 
+	trace_gb_connection_create(connection);
+
 	return connection;
 
 err_free_connection:
 	kfree(connection);
-err_remove_ida:
-	ida_simple_remove(id_map, hd_cport_id);
+err_hd_cport_release:
+	gb_hd_cport_release(hd, hd_cport_id);
 err_unlock:
 	mutex_unlock(&gb_connection_mutex);
 
@@ -230,13 +234,15 @@ gb_connection_create_static(struct gb_host_device *hd, u16 hd_cport_id,
 					gb_request_handler_t handler)
 {
 	return _gb_connection_create(hd, hd_cport_id, NULL, NULL, 0, handler,
-					0);
+					GB_CONNECTION_FLAG_HIGH_PRIO);
 }
 
 struct gb_connection *
 gb_connection_create_control(struct gb_interface *intf)
 {
-	return _gb_connection_create(intf->hd, -1, intf, NULL, 0, NULL, 0);
+	return _gb_connection_create(intf->hd, -1, intf, NULL, 0, NULL,
+					GB_CONNECTION_FLAG_CONTROL |
+					GB_CONNECTION_FLAG_HIGH_PRIO);
 }
 
 struct gb_connection *
@@ -257,10 +263,23 @@ gb_connection_create_flags(struct gb_bundle *bundle, u16 cport_id,
 {
 	struct gb_interface *intf = bundle->intf;
 
+	if (WARN_ON_ONCE(flags & GB_CONNECTION_FLAG_CORE_MASK))
+		flags &= ~GB_CONNECTION_FLAG_CORE_MASK;
+
 	return _gb_connection_create(intf->hd, -1, intf, bundle, cport_id,
 					handler, flags);
 }
 EXPORT_SYMBOL_GPL(gb_connection_create_flags);
+
+struct gb_connection *
+gb_connection_create_offloaded(struct gb_bundle *bundle, u16 cport_id,
+					unsigned long flags)
+{
+	flags |= GB_CONNECTION_FLAG_OFFLOADED;
+
+	return gb_connection_create_flags(bundle, cport_id, NULL, flags);
+}
+EXPORT_SYMBOL_GPL(gb_connection_create_offloaded);
 
 static int gb_connection_hd_cport_enable(struct gb_connection *connection)
 {
@@ -270,10 +289,11 @@ static int gb_connection_hd_cport_enable(struct gb_connection *connection)
 	if (!hd->driver->cport_enable)
 		return 0;
 
-	ret = hd->driver->cport_enable(hd, connection->hd_cport_id);
+	ret = hd->driver->cport_enable(hd, connection->hd_cport_id,
+					connection->flags);
 	if (ret) {
-		dev_err(&hd->dev,
-			"failed to enable host cport: %d\n", ret);
+		dev_err(&hd->dev, "%s: failed to enable host cport: %d\n",
+				connection->name, ret);
 		return ret;
 	}
 
@@ -283,41 +303,91 @@ static int gb_connection_hd_cport_enable(struct gb_connection *connection)
 static void gb_connection_hd_cport_disable(struct gb_connection *connection)
 {
 	struct gb_host_device *hd = connection->hd;
+	int ret;
 
 	if (!hd->driver->cport_disable)
 		return;
 
-	hd->driver->cport_disable(hd, connection->hd_cport_id);
+	ret = hd->driver->cport_disable(hd, connection->hd_cport_id);
+	if (ret) {
+		dev_err(&hd->dev, "%s: failed to disable host cport: %d\n",
+				connection->name, ret);
+	}
 }
 
-static int
-gb_connection_hd_cport_features_enable(struct gb_connection *connection)
+static int gb_connection_hd_cport_connected(struct gb_connection *connection)
 {
 	struct gb_host_device *hd = connection->hd;
 	int ret;
 
-	if (!hd->driver->cport_features_enable)
+	if (!hd->driver->cport_connected)
 		return 0;
 
-	ret = hd->driver->cport_features_enable(hd, connection->hd_cport_id);
+	ret = hd->driver->cport_connected(hd, connection->hd_cport_id);
 	if (ret) {
-		dev_err(&hd->dev, "%s: failed to enable CPort features: %d\n",
-			connection->name, ret);
+		dev_err(&hd->dev, "%s: failed to set connected state: %d\n",
+				connection->name, ret);
 		return ret;
 	}
 
 	return 0;
 }
 
-static void
-gb_connection_hd_cport_features_disable(struct gb_connection *connection)
+static int gb_connection_hd_cport_flush(struct gb_connection *connection)
 {
 	struct gb_host_device *hd = connection->hd;
+	int ret;
 
-	if (!hd->driver->cport_features_disable)
-		return;
+	if (!hd->driver->cport_flush)
+		return 0;
 
-	hd->driver->cport_features_disable(hd, connection->hd_cport_id);
+	ret = hd->driver->cport_flush(hd, connection->hd_cport_id);
+	if (ret) {
+		dev_err(&hd->dev, "%s: failed to flush host cport: %d\n",
+				connection->name, ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int gb_connection_hd_cport_quiesce(struct gb_connection *connection)
+{
+	struct gb_host_device *hd = connection->hd;
+	size_t peer_space;
+	int ret;
+
+	peer_space = sizeof(struct gb_operation_msg_hdr) +
+			sizeof(struct gb_cport_shutdown_request);
+
+	if (connection->mode_switch)
+		peer_space += sizeof(struct gb_operation_msg_hdr);
+
+	ret = hd->driver->cport_quiesce(hd, connection->hd_cport_id,
+					peer_space,
+					GB_CONNECTION_CPORT_QUIESCE_TIMEOUT);
+	if (ret) {
+		dev_err(&hd->dev, "%s: failed to quiesce host cport: %d\n",
+				connection->name, ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int gb_connection_hd_cport_clear(struct gb_connection *connection)
+{
+	struct gb_host_device *hd = connection->hd;
+	int ret;
+
+	ret = hd->driver->cport_clear(hd, connection->hd_cport_id);
+	if (ret) {
+		dev_err(&hd->dev, "%s: failed to clear host cport: %d\n",
+				connection->name, ret);
+		return ret;
+	}
+
+	return 0;
 }
 
 /*
@@ -333,16 +403,15 @@ gb_connection_svc_connection_create(struct gb_connection *connection)
 	int ret;
 
 	if (gb_connection_is_static(connection))
-		return gb_connection_hd_cport_features_enable(connection);
+		return 0;
 
 	intf = connection->intf;
 
 	/*
-	 * Enable either E2EFC or CSD, unless the interface does not support
-	 * any CPort features.
+	 * Enable either E2EFC or CSD, unless no flow control is requested.
 	 */
 	cport_flags = GB_SVC_CPORT_FLAG_CSV_N;
-	if (intf->quirks & GB_INTERFACE_QUIRK_NO_CPORT_FEATURES) {
+	if (gb_connection_flow_control_disabled(connection)) {
 		cport_flags |= GB_SVC_CPORT_FLAG_CSD_N;
 	} else if (gb_connection_e2efc_enabled(connection)) {
 		cport_flags |= GB_SVC_CPORT_FLAG_CSD_N |
@@ -362,23 +431,12 @@ gb_connection_svc_connection_create(struct gb_connection *connection)
 		return ret;
 	}
 
-	ret = gb_connection_hd_cport_features_enable(connection);
-	if (ret) {
-		gb_svc_connection_destroy(hd->svc, hd->svc->ap_intf_id,
-					  connection->hd_cport_id,
-					  intf->interface_id,
-					  connection->intf_cport_id);
-		return ret;
-	}
-
 	return 0;
 }
 
 static void
 gb_connection_svc_connection_destroy(struct gb_connection *connection)
 {
-	gb_connection_hd_cport_features_disable(connection);
-
 	if (gb_connection_is_static(connection))
 		return;
 
@@ -399,10 +457,10 @@ static int gb_connection_control_connected(struct gb_connection *connection)
 	if (gb_connection_is_static(connection))
 		return 0;
 
-	control = connection->intf->control;
-
-	if (connection == control->connection)
+	if (gb_connection_is_control(connection))
 		return 0;
+
+	control = connection->intf->control;
 
 	ret = gb_control_connected_operation(control, cport_id);
 	if (ret) {
@@ -414,7 +472,26 @@ static int gb_connection_control_connected(struct gb_connection *connection)
 	return 0;
 }
 
-/* Inform Interface about inactive CPorts */
+static void
+gb_connection_control_disconnecting(struct gb_connection *connection)
+{
+	struct gb_control *control;
+	u16 cport_id = connection->intf_cport_id;
+	int ret;
+
+	if (gb_connection_is_static(connection))
+		return;
+
+	control = connection->intf->control;
+
+	ret = gb_control_disconnecting_operation(control, cport_id);
+	if (ret) {
+		dev_err(&connection->hd->dev,
+				"%s: failed to send disconnecting: %d\n",
+				connection->name, ret);
+	}
+}
+
 static void
 gb_connection_control_disconnected(struct gb_connection *connection)
 {
@@ -427,8 +504,20 @@ gb_connection_control_disconnected(struct gb_connection *connection)
 
 	control = connection->intf->control;
 
-	if (connection == control->connection)
+	if (gb_connection_is_control(connection)) {
+		if (connection->mode_switch) {
+			ret = gb_control_mode_switch_operation(control);
+			if (ret) {
+				/*
+				 * Allow mode switch to time out waiting for
+				 * mailbox event.
+				 */
+				return;
+			}
+		}
+
 		return;
+	}
 
 	ret = gb_control_disconnected_operation(control, cport_id);
 	if (ret) {
@@ -437,10 +526,76 @@ gb_connection_control_disconnected(struct gb_connection *connection)
 	}
 }
 
+static int gb_connection_shutdown_operation(struct gb_connection *connection,
+						u8 phase)
+{
+	struct gb_cport_shutdown_request *req;
+	struct gb_operation *operation;
+	int ret;
+
+	operation = gb_operation_create_core(connection,
+						GB_REQUEST_TYPE_CPORT_SHUTDOWN,
+						sizeof(*req), 0, 0,
+						GFP_KERNEL);
+	if (!operation)
+		return -ENOMEM;
+
+	req = operation->request->payload;
+	req->phase = phase;
+
+	ret = gb_operation_request_send_sync(operation);
+
+	gb_operation_put(operation);
+
+	return ret;
+}
+
+static int gb_connection_cport_shutdown(struct gb_connection *connection,
+					u8 phase)
+{
+	struct gb_host_device *hd = connection->hd;
+	const struct gb_hd_driver *drv = hd->driver;
+	int ret;
+
+	if (gb_connection_is_static(connection))
+		return 0;
+
+	if (gb_connection_is_offloaded(connection)) {
+		if (!drv->cport_shutdown)
+			return 0;
+
+		ret = drv->cport_shutdown(hd, connection->hd_cport_id, phase,
+						GB_OPERATION_TIMEOUT_DEFAULT);
+	} else {
+		ret = gb_connection_shutdown_operation(connection, phase);
+	}
+
+	if (ret) {
+		dev_err(&hd->dev, "%s: failed to send cport shutdown (phase %d): %d\n",
+				connection->name, phase, ret);
+		return ret;
+	}
+
+	return 0;
+}
+
+static int
+gb_connection_cport_shutdown_phase_1(struct gb_connection *connection)
+{
+	return gb_connection_cport_shutdown(connection, 1);
+}
+
+static int
+gb_connection_cport_shutdown_phase_2(struct gb_connection *connection)
+{
+	return gb_connection_cport_shutdown(connection, 2);
+}
+
 /*
  * Cancel all active operations on a connection.
  *
- * Locking: Called with connection lock held and state set to DISABLED.
+ * Locking: Called with connection lock held and state set to DISABLED or
+ * DISCONNECTING.
  */
 static void gb_connection_cancel_operations(struct gb_connection *connection,
 						int errno)
@@ -534,7 +689,11 @@ static int _gb_connection_enable(struct gb_connection *connection, bool rx)
 
 	ret = gb_connection_svc_connection_create(connection);
 	if (ret)
-		goto err_hd_cport_disable;
+		goto err_hd_cport_clear;
+
+	ret = gb_connection_hd_cport_connected(connection);
+	if (ret)
+		goto err_svc_connection_destroy;
 
 	spin_lock_irq(&connection->lock);
 	if (connection->handler && rx)
@@ -545,18 +704,30 @@ static int _gb_connection_enable(struct gb_connection *connection, bool rx)
 
 	ret = gb_connection_control_connected(connection);
 	if (ret)
-		goto err_svc_destroy;
+		goto err_control_disconnecting;
 
 	return 0;
 
-err_svc_destroy:
+err_control_disconnecting:
 	spin_lock_irq(&connection->lock);
-	connection->state = GB_CONNECTION_STATE_DISABLED;
+	connection->state = GB_CONNECTION_STATE_DISCONNECTING;
 	gb_connection_cancel_operations(connection, -ESHUTDOWN);
 	spin_unlock_irq(&connection->lock);
 
+	/* Transmit queue should already be empty. */
+	gb_connection_hd_cport_flush(connection);
+
+	gb_connection_control_disconnecting(connection);
+	gb_connection_cport_shutdown_phase_1(connection);
+	gb_connection_hd_cport_quiesce(connection);
+	gb_connection_cport_shutdown_phase_2(connection);
+	gb_connection_control_disconnected(connection);
+	connection->state = GB_CONNECTION_STATE_DISABLED;
+err_svc_connection_destroy:
 	gb_connection_svc_connection_destroy(connection);
-err_hd_cport_disable:
+err_hd_cport_clear:
+	gb_connection_hd_cport_clear(connection);
+
 	gb_connection_hd_cport_disable(connection);
 
 	return ret;
@@ -572,6 +743,9 @@ int gb_connection_enable(struct gb_connection *connection)
 		goto out_unlock;
 
 	ret = _gb_connection_enable(connection, true);
+	if (!ret)
+		trace_gb_connection_enable(connection);
+
 out_unlock:
 	mutex_unlock(&connection->mutex);
 
@@ -594,6 +768,9 @@ int gb_connection_enable_tx(struct gb_connection *connection)
 		goto out_unlock;
 
 	ret = _gb_connection_enable(connection, false);
+	if (!ret)
+		trace_gb_connection_enable(connection);
+
 out_unlock:
 	mutex_unlock(&connection->mutex);
 
@@ -614,10 +791,27 @@ void gb_connection_disable_rx(struct gb_connection *connection)
 	gb_connection_flush_incoming_operations(connection, -ESHUTDOWN);
 	spin_unlock_irq(&connection->lock);
 
+	trace_gb_connection_disable(connection);
+
 out_unlock:
 	mutex_unlock(&connection->mutex);
 }
 EXPORT_SYMBOL_GPL(gb_connection_disable_rx);
+
+void gb_connection_mode_switch_prepare(struct gb_connection *connection)
+{
+	connection->mode_switch = true;
+}
+
+void gb_connection_mode_switch_complete(struct gb_connection *connection)
+{
+	gb_connection_svc_connection_destroy(connection);
+	gb_connection_hd_cport_clear(connection);
+
+	gb_connection_hd_cport_disable(connection);
+
+	connection->mode_switch = false;
+}
 
 void gb_connection_disable(struct gb_connection *connection)
 {
@@ -626,28 +820,70 @@ void gb_connection_disable(struct gb_connection *connection)
 	if (connection->state == GB_CONNECTION_STATE_DISABLED)
 		goto out_unlock;
 
-	gb_connection_control_disconnected(connection);
+	trace_gb_connection_disable(connection);
 
 	spin_lock_irq(&connection->lock);
-	connection->state = GB_CONNECTION_STATE_DISABLED;
+	connection->state = GB_CONNECTION_STATE_DISCONNECTING;
 	gb_connection_cancel_operations(connection, -ESHUTDOWN);
 	spin_unlock_irq(&connection->lock);
 
-	gb_connection_svc_connection_destroy(connection);
-	gb_connection_hd_cport_disable(connection);
+	gb_connection_hd_cport_flush(connection);
+
+	gb_connection_control_disconnecting(connection);
+	gb_connection_cport_shutdown_phase_1(connection);
+	gb_connection_hd_cport_quiesce(connection);
+	gb_connection_cport_shutdown_phase_2(connection);
+	gb_connection_control_disconnected(connection);
+
+	connection->state = GB_CONNECTION_STATE_DISABLED;
+
+	/* control-connection tear down is deferred when mode switching */
+	if (!connection->mode_switch) {
+		gb_connection_svc_connection_destroy(connection);
+		gb_connection_hd_cport_clear(connection);
+
+		gb_connection_hd_cport_disable(connection);
+	}
 
 out_unlock:
 	mutex_unlock(&connection->mutex);
 }
 EXPORT_SYMBOL_GPL(gb_connection_disable);
 
+/* Disable a connection without communicating with the remote end. */
+void gb_connection_disable_forced(struct gb_connection *connection)
+{
+	mutex_lock(&connection->mutex);
+
+	if (connection->state == GB_CONNECTION_STATE_DISABLED)
+		goto out_unlock;
+
+	trace_gb_connection_disable(connection);
+
+	spin_lock_irq(&connection->lock);
+	connection->state = GB_CONNECTION_STATE_DISABLED;
+	gb_connection_cancel_operations(connection, -ESHUTDOWN);
+	spin_unlock_irq(&connection->lock);
+
+	gb_connection_hd_cport_flush(connection);
+
+	gb_connection_svc_connection_destroy(connection);
+	gb_connection_hd_cport_clear(connection);
+
+	gb_connection_hd_cport_disable(connection);
+out_unlock:
+	mutex_unlock(&connection->mutex);
+}
+EXPORT_SYMBOL_GPL(gb_connection_disable_forced);
+
 /* Caller must have disabled the connection before destroying it. */
 void gb_connection_destroy(struct gb_connection *connection)
 {
-	struct ida *id_map;
-
 	if (!connection)
 		return;
+
+	if (WARN_ON(connection->state != GB_CONNECTION_STATE_DISABLED))
+		gb_connection_disable(connection);
 
 	mutex_lock(&gb_connection_mutex);
 
@@ -658,8 +894,7 @@ void gb_connection_destroy(struct gb_connection *connection)
 
 	destroy_workqueue(connection->wq);
 
-	id_map = &connection->hd->cport_id_map;
-	ida_simple_remove(id_map, connection->hd_cport_id);
+	gb_hd_cport_release(connection->hd, connection->hd_cport_id);
 	connection->hd_cport_id = CPORT_ID_BAD;
 
 	mutex_unlock(&gb_connection_mutex);

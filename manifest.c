@@ -250,6 +250,13 @@ static u32 gb_manifest_parse_cports(struct gb_bundle *bundle)
 		if (cport_id > CPORT_ID_MAX)
 			goto exit;
 
+		/* Nothing else should have its cport_id as control cport id */
+		if (cport_id == GB_CONTROL_CPORT_ID) {
+			dev_err(&bundle->dev, "invalid cport id found (%02u)\n",
+				cport_id);
+			goto exit;
+		}
+
 		/*
 		 * Found one, move it to our temporary list after checking for
 		 * duplicates.
@@ -397,6 +404,9 @@ static bool gb_manifest_parse_interface(struct gb_interface *intf,
 	if (IS_ERR(str))
 		goto out_free_vendor_string;
 	control->product_string = str;
+
+	/* Assign feature flags communicated via manifest */
+	intf->features = desc_intf->features;
 
 	/* Release the interface descriptor, now that we're done with it */
 	release_manifest_descriptor(interface_desc);

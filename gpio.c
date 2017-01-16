@@ -16,7 +16,7 @@
 #include <linux/mutex.h>
 
 #include "greybus.h"
-#include "gpbridge.h"
+#include "gbphy.h"
 
 struct gb_gpio_line {
 	/* The following has to be an array of line_max entries */
@@ -33,7 +33,7 @@ struct gb_gpio_line {
 };
 
 struct gb_gpio_controller {
-	struct gpbridge_device	*gpbdev;
+	struct gbphy_device	*gbphy_dev;
 	struct gb_connection	*connection;
 	u8			line_max;	/* max line number */
 	struct gb_gpio_line	*lines;
@@ -66,20 +66,31 @@ static int gb_gpio_line_count_operation(struct gb_gpio_controller *ggc)
 static int gb_gpio_activate_operation(struct gb_gpio_controller *ggc, u8 which)
 {
 	struct gb_gpio_activate_request request;
+	struct gbphy_device *gbphy_dev = ggc->gbphy_dev;
 	int ret;
+
+	ret = gbphy_runtime_get_sync(gbphy_dev);
+	if (ret)
+		return ret;
 
 	request.which = which;
 	ret = gb_operation_sync(ggc->connection, GB_GPIO_TYPE_ACTIVATE,
 				 &request, sizeof(request), NULL, 0);
-	if (!ret)
-		ggc->lines[which].active = true;
-	return ret;
+	if (ret) {
+		gbphy_runtime_put_autosuspend(gbphy_dev);
+		return ret;
+	}
+
+	ggc->lines[which].active = true;
+
+	return 0;
 }
 
 static void gb_gpio_deactivate_operation(struct gb_gpio_controller *ggc,
 					u8 which)
 {
-	struct device *dev = &ggc->gpbdev->dev;
+	struct gbphy_device *gbphy_dev = ggc->gbphy_dev;
+	struct device *dev = &gbphy_dev->dev;
 	struct gb_gpio_deactivate_request request;
 	int ret;
 
@@ -88,16 +99,19 @@ static void gb_gpio_deactivate_operation(struct gb_gpio_controller *ggc,
 				 &request, sizeof(request), NULL, 0);
 	if (ret) {
 		dev_err(dev, "failed to deactivate gpio %u\n", which);
-		return;
+		goto out_pm_put;
 	}
 
 	ggc->lines[which].active = false;
+
+out_pm_put:
+	gbphy_runtime_put_autosuspend(gbphy_dev);
 }
 
 static int gb_gpio_get_direction_operation(struct gb_gpio_controller *ggc,
 					u8 which)
 {
-	struct device *dev = &ggc->gpbdev->dev;
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_gpio_get_direction_request request;
 	struct gb_gpio_get_direction_response response;
 	int ret;
@@ -151,7 +165,7 @@ static int gb_gpio_direction_out_operation(struct gb_gpio_controller *ggc,
 static int gb_gpio_get_value_operation(struct gb_gpio_controller *ggc,
 					u8 which)
 {
-	struct device *dev = &ggc->gpbdev->dev;
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_gpio_get_value_request request;
 	struct gb_gpio_get_value_response response;
 	int ret;
@@ -178,7 +192,7 @@ static int gb_gpio_get_value_operation(struct gb_gpio_controller *ggc,
 static void gb_gpio_set_value_operation(struct gb_gpio_controller *ggc,
 					u8 which, bool value_high)
 {
-	struct device *dev = &ggc->gpbdev->dev;
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_gpio_set_value_request request;
 	int ret;
 
@@ -217,7 +231,7 @@ static int gb_gpio_set_debounce_operation(struct gb_gpio_controller *ggc,
 
 static void _gb_gpio_irq_mask(struct gb_gpio_controller *ggc, u8 hwirq)
 {
-	struct device *dev = &ggc->gpbdev->dev;
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_gpio_irq_mask_request request;
 	int ret;
 
@@ -231,7 +245,7 @@ static void _gb_gpio_irq_mask(struct gb_gpio_controller *ggc, u8 hwirq)
 
 static void _gb_gpio_irq_unmask(struct gb_gpio_controller *ggc, u8 hwirq)
 {
-	struct device *dev = &ggc->gpbdev->dev;
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_gpio_irq_unmask_request request;
 	int ret;
 
@@ -246,7 +260,7 @@ static void _gb_gpio_irq_unmask(struct gb_gpio_controller *ggc, u8 hwirq)
 static void _gb_gpio_irq_set_type(struct gb_gpio_controller *ggc,
 					u8 hwirq, u8 type)
 {
-	struct device *dev = &ggc->gpbdev->dev;
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_gpio_irq_type_request request;
 	int ret;
 
@@ -285,7 +299,7 @@ static int gb_gpio_irq_set_type(struct irq_data *d, unsigned int type)
 	struct gpio_chip *chip = irq_data_to_gpio_chip(d);
 	struct gb_gpio_controller *ggc = gpio_chip_to_gb_gpio_controller(chip);
 	struct gb_gpio_line *line = &ggc->lines[d->hwirq];
-	struct device *dev = &ggc->gpbdev->dev;
+	struct device *dev = &ggc->gbphy_dev->dev;
 	u8 irq_type;
 
 	switch (type) {
@@ -352,7 +366,7 @@ static int gb_gpio_request_handler(struct gb_operation *op)
 {
 	struct gb_connection *connection = op->connection;
 	struct gb_gpio_controller *ggc = gb_connection_get_data(connection);
-	struct device *dev = &ggc->gpbdev->dev;
+	struct device *dev = &ggc->gbphy_dev->dev;
 	struct gb_message *request;
 	struct gb_gpio_irq_event_request *event;
 	u8 type = op->type;
@@ -556,7 +570,6 @@ static void gb_gpio_irqchip_remove(struct gb_gpio_controller *ggc)
 	}
 }
 
-
 /**
  * gb_gpio_irqchip_add() - adds an irqchip to a gpio chip
  * @chip: the gpio chip to add the irqchip to
@@ -624,8 +637,8 @@ static int gb_gpio_to_irq(struct gpio_chip *chip, unsigned offset)
 	return irq_find_mapping(ggc->irqdomain, offset);
 }
 
-static int gb_gpio_probe(struct gpbridge_device *gpbdev,
-			 const struct gpbridge_device_id *id)
+static int gb_gpio_probe(struct gbphy_device *gbphy_dev,
+			 const struct gbphy_device_id *id)
 {
 	struct gb_connection *connection;
 	struct gb_gpio_controller *ggc;
@@ -637,8 +650,8 @@ static int gb_gpio_probe(struct gpbridge_device *gpbdev,
 	if (!ggc)
 		return -ENOMEM;
 
-	connection = gb_connection_create(gpbdev->bundle,
-					  le16_to_cpu(gpbdev->cport_desc->id),
+	connection = gb_connection_create(gbphy_dev->bundle,
+					  le16_to_cpu(gbphy_dev->cport_desc->id),
 					  gb_gpio_request_handler);
 	if (IS_ERR(connection)) {
 		ret = PTR_ERR(connection);
@@ -647,16 +660,12 @@ static int gb_gpio_probe(struct gpbridge_device *gpbdev,
 
 	ggc->connection = connection;
 	gb_connection_set_data(connection, ggc);
-	ggc->gpbdev = gpbdev;
-	gb_gpbridge_set_data(gpbdev, ggc);
+	ggc->gbphy_dev = gbphy_dev;
+	gb_gbphy_set_data(gbphy_dev, ggc);
 
 	ret = gb_connection_enable_tx(connection);
 	if (ret)
 		goto exit_connection_destroy;
-
-	ret = gb_gpbridge_get_version(connection);
-	if (ret)
-		goto exit_connection_disable;
 
 	ret = gb_gpio_controller_setup(ggc);
 	if (ret)
@@ -676,9 +685,9 @@ static int gb_gpio_probe(struct gpbridge_device *gpbdev,
 
 	gpio->label = "greybus_gpio";
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)
-	gpio->parent = &gpbdev->dev;
+	gpio->parent = &gbphy_dev->dev;
 #else
-	gpio->dev = &gpbdev->dev;
+	gpio->dev = &gbphy_dev->dev;
 #endif
 	gpio->owner = THIS_MODULE;
 
@@ -699,25 +708,26 @@ static int gb_gpio_probe(struct gpbridge_device *gpbdev,
 	if (ret)
 		goto exit_line_free;
 
-	ret = gpiochip_add(gpio);
-	if (ret) {
-		dev_err(&connection->bundle->dev,
-			"failed to add gpio chip: %d\n", ret);
-		goto exit_line_free;
-	}
-
 	ret = gb_gpio_irqchip_add(gpio, irqc, 0,
 				   handle_level_irq, IRQ_TYPE_NONE);
 	if (ret) {
 		dev_err(&connection->bundle->dev,
 			"failed to add irq chip: %d\n", ret);
-		goto exit_gpiochip_remove;
+		goto exit_line_free;
 	}
 
+	ret = gpiochip_add(gpio);
+	if (ret) {
+		dev_err(&connection->bundle->dev,
+			"failed to add gpio chip: %d\n", ret);
+		goto exit_gpio_irqchip_remove;
+	}
+
+	gbphy_runtime_put_autosuspend(gbphy_dev);
 	return 0;
 
-exit_gpiochip_remove:
-	gb_gpiochip_remove(gpio);
+exit_gpio_irqchip_remove:
+	gb_gpio_irqchip_remove(ggc);
 exit_line_free:
 	kfree(ggc->lines);
 exit_connection_disable:
@@ -729,29 +739,37 @@ exit_ggc_free:
 	return ret;
 }
 
-static void gb_gpio_remove(struct gpbridge_device *gpbdev)
+static void gb_gpio_remove(struct gbphy_device *gbphy_dev)
 {
-	struct gb_gpio_controller *ggc = gb_gpbridge_get_data(gpbdev);
+	struct gb_gpio_controller *ggc = gb_gbphy_get_data(gbphy_dev);
 	struct gb_connection *connection = ggc->connection;
+	int ret;
+
+	ret = gbphy_runtime_get_sync(gbphy_dev);
+	if (ret)
+		gbphy_runtime_get_noresume(gbphy_dev);
 
 	gb_connection_disable_rx(connection);
-	gb_gpio_irqchip_remove(ggc);
 	gb_gpiochip_remove(&ggc->chip);
+	gb_gpio_irqchip_remove(ggc);
 	gb_connection_disable(connection);
 	gb_connection_destroy(connection);
 	kfree(ggc->lines);
 	kfree(ggc);
 }
 
-static const struct gpbridge_device_id gb_gpio_id_table[] = {
-	{ GPBRIDGE_PROTOCOL(GREYBUS_PROTOCOL_GPIO) },
+static const struct gbphy_device_id gb_gpio_id_table[] = {
+	{ GBPHY_PROTOCOL(GREYBUS_PROTOCOL_GPIO) },
 	{ },
 };
+MODULE_DEVICE_TABLE(gbphy, gb_gpio_id_table);
 
-static struct gpbridge_driver gpio_driver = {
+static struct gbphy_driver gpio_driver = {
 	.name		= "gpio",
 	.probe		= gb_gpio_probe,
 	.remove		= gb_gpio_remove,
 	.id_table	= gb_gpio_id_table,
 };
-gb_gpbridge_builtin_driver(gpio_driver);
+
+module_gbphy_driver(gpio_driver);
+MODULE_LICENSE("GPL v2");

@@ -14,8 +14,6 @@
 #include "firmware.h"
 #include "greybus.h"
 
-/* Length of the string in format: ara_%08x_%08x_%08x_%08x_%s.tftf */
-#define FW_NAME_LEN		56
 /* Estimated minimum buffer size, actual size can be smaller than this */
 #define MIN_FETCH_SIZE		512
 /* Timeout, in jiffies, within which fetch or release firmware must be called */
@@ -25,7 +23,7 @@ struct fw_request {
 	u8			firmware_id;
 	bool			disabled;
 	bool			timedout;
-	char			name[FW_NAME_LEN];
+	char			name[FW_NAME_SIZE];
 	const struct firmware	*fw;
 	struct list_head	node;
 
@@ -182,7 +180,7 @@ static struct fw_request *find_firmware(struct fw_download *fw_download,
 	fw_req->firmware_id = ret;
 
 	snprintf(fw_req->name, sizeof(fw_req->name),
-		 "ara_%08x_%08x_%08x_%08x_%s.tftf",
+		 FW_NAME_PREFIX "%08x_%08x_%08x_%08x_%s.tftf",
 		 intf->ddbl1_manufacturer_id, intf->ddbl1_product_id,
 		 intf->vendor_id, intf->product_id, tag);
 
@@ -238,16 +236,16 @@ static int fw_download_find_firmware(struct gb_operation *op)
 	}
 
 	request = op->request->payload;
-	tag = (const char *)(request->firmware_tag);
+	tag = (const char *)request->firmware_tag;
 
-	/* firmware_tag should be null-terminated */
-	if (strnlen(tag, GB_FIRMWARE_TAG_MAX_LEN) == GB_FIRMWARE_TAG_MAX_LEN) {
+	/* firmware_tag must be null-terminated */
+	if (strnlen(tag, GB_FIRMWARE_TAG_MAX_SIZE) == GB_FIRMWARE_TAG_MAX_SIZE) {
 		dev_err(fw_download->parent,
 			"firmware-tag is not null-terminated\n");
 		return -EINVAL;
 	}
 
-	fw_req = find_firmware(fw_download, request->firmware_tag);
+	fw_req = find_firmware(fw_download, tag);
 	if (IS_ERR(fw_req))
 		return PTR_ERR(fw_req);
 

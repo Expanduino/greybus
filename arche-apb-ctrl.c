@@ -42,6 +42,10 @@ struct arche_apb_ctrl_drvdata {
 
 	struct pinctrl *pinctrl;
 	struct pinctrl_state *pin_default;
+
+	/* V2: SPI Bus control  */
+	int spi_en_gpio;
+	bool spi_en_polarity_high;
 };
 
 /*
@@ -73,6 +77,10 @@ static int coldboot_seq(struct platform_device *pdev)
 	/* Hold APB in reset state */
 	assert_reset(apb->resetn_gpio);
 
+	if (apb->state == ARCHE_PLATFORM_STATE_FW_FLASHING &&
+			gpio_is_valid(apb->spi_en_gpio))
+		devm_gpio_free(dev, apb->spi_en_gpio);
+
 	/* Enable power to APB */
 	if (!IS_ERR(apb->vcore)) {
 		ret = regulator_enable(apb->vcore);
@@ -90,7 +98,7 @@ static int coldboot_seq(struct platform_device *pdev)
 		}
 	}
 
-	gpio_set_value(apb->boot_ret_gpio, 0);
+	apb_bootret_deassert(dev);
 
 	/* On DB3 clock was not mandatory */
 	if (gpio_is_valid(apb->clk_en_gpio))
@@ -128,6 +136,23 @@ static int fw_flashing_seq(struct platform_device *pdev)
 		return ret;
 	}
 
+	if (gpio_is_valid(apb->spi_en_gpio)) {
+		unsigned long flags;
+
+		if (apb->spi_en_polarity_high)
+			flags = GPIOF_OUT_INIT_HIGH;
+		else
+			flags = GPIOF_OUT_INIT_LOW;
+
+		ret = devm_gpio_request_one(dev, apb->spi_en_gpio,
+				flags, "apb_spi_en");
+		if (ret) {
+			dev_err(dev, "Failed requesting SPI bus en gpio %d\n",
+				apb->spi_en_gpio);
+			return ret;
+		}
+	}
+
 	/* for flashing device should be in reset state */
 	assert_reset(apb->resetn_gpio);
 	apb->state = ARCHE_PLATFORM_STATE_FW_FLASHING;
@@ -137,6 +162,7 @@ static int fw_flashing_seq(struct platform_device *pdev)
 
 static int standby_boot_seq(struct platform_device *pdev)
 {
+	struct device *dev = &pdev->dev;
 	struct arche_apb_ctrl_drvdata *apb = platform_get_drvdata(pdev);
 
 	if (apb->init_disabled)
@@ -146,6 +172,10 @@ static int standby_boot_seq(struct platform_device *pdev)
 	if (apb->state == ARCHE_PLATFORM_STATE_STANDBY ||
 			apb->state == ARCHE_PLATFORM_STATE_OFF)
 		return 0;
+
+	if (apb->state == ARCHE_PLATFORM_STATE_FW_FLASHING &&
+			gpio_is_valid(apb->spi_en_gpio))
+		devm_gpio_free(dev, apb->spi_en_gpio);
 
 	/*
 	 * As per WDM spec, do nothing
@@ -162,10 +192,15 @@ static int standby_boot_seq(struct platform_device *pdev)
 
 static void poweroff_seq(struct platform_device *pdev)
 {
+	struct device *dev = &pdev->dev;
 	struct arche_apb_ctrl_drvdata *apb = platform_get_drvdata(pdev);
 
 	if (apb->init_disabled || apb->state == ARCHE_PLATFORM_STATE_OFF)
 		return;
+
+	if (apb->state == ARCHE_PLATFORM_STATE_FW_FLASHING &&
+			gpio_is_valid(apb->spi_en_gpio))
+		devm_gpio_free(dev, apb->spi_en_gpio);
 
 	/* disable the clock */
 	if (gpio_is_valid(apb->clk_en_gpio))
@@ -182,6 +217,20 @@ static void poweroff_seq(struct platform_device *pdev)
 	apb->state = ARCHE_PLATFORM_STATE_OFF;
 
 	/* TODO: May have to send an event to SVC about this exit */
+}
+
+void apb_bootret_assert(struct device *dev)
+{
+	struct arche_apb_ctrl_drvdata *apb = dev_get_drvdata(dev);
+
+	gpio_set_value(apb->boot_ret_gpio, 1);
+}
+
+void apb_bootret_deassert(struct device *dev)
+{
+	struct arche_apb_ctrl_drvdata *apb = dev_get_drvdata(dev);
+
+	gpio_set_value(apb->boot_ret_gpio, 0);
 }
 
 int apb_ctrl_coldboot(struct device *dev)
@@ -355,6 +404,14 @@ static int apb_ctrl_get_devtree_data(struct platform_device *pdev,
 		return PTR_ERR(apb->pin_default);
 	}
 
+	/* Only applicable for platform >= V2 */
+	apb->spi_en_gpio = of_get_named_gpio(np, "spi-en-gpio", 0);
+	if (apb->spi_en_gpio >= 0) {
+		if (of_property_read_bool(pdev->dev.of_node,
+					"spi-en-active-high"))
+			apb->spi_en_polarity_high = true;
+	}
+
 	return 0;
 }
 
@@ -377,7 +434,7 @@ static int arche_apb_ctrl_probe(struct platform_device *pdev)
 	/* Initially set APB to OFF state */
 	apb->state = ARCHE_PLATFORM_STATE_OFF;
 	/* Check whether device needs to be enabled on boot */
-	if (of_property_read_bool(pdev->dev.of_node, "ara,init-disable"))
+	if (of_property_read_bool(pdev->dev.of_node, "arche,init-disable"))
 		apb->init_disabled = true;
 
 	platform_set_drvdata(pdev, apb);
@@ -430,6 +487,11 @@ static int arche_apb_ctrl_resume(struct device *dev)
 	return 0;
 }
 
+static void arche_apb_ctrl_shutdown(struct platform_device *pdev)
+{
+	apb_ctrl_poweroff(&pdev->dev);
+}
+
 static SIMPLE_DEV_PM_OPS(arche_apb_ctrl_pm_ops, arche_apb_ctrl_suspend,
 			 arche_apb_ctrl_resume);
 
@@ -441,6 +503,7 @@ static struct of_device_id arche_apb_ctrl_of_match[] = {
 static struct platform_driver arche_apb_ctrl_device_driver = {
 	.probe		= arche_apb_ctrl_probe,
 	.remove		= arche_apb_ctrl_remove,
+	.shutdown	= arche_apb_ctrl_shutdown,
 	.driver		= {
 		.name	= "arche-apb-ctrl",
 		.pm	= &arche_apb_ctrl_pm_ops,

@@ -46,20 +46,34 @@ static int gb_operation_get_active(struct gb_operation *operation)
 	unsigned long flags;
 
 	spin_lock_irqsave(&connection->lock, flags);
-
-	if (connection->state != GB_CONNECTION_STATE_ENABLED &&
-			connection->state != GB_CONNECTION_STATE_ENABLED_TX &&
-			!gb_operation_is_incoming(operation)) {
-		spin_unlock_irqrestore(&connection->lock, flags);
-		return -ENOTCONN;
+	switch (connection->state) {
+	case GB_CONNECTION_STATE_ENABLED:
+		break;
+	case GB_CONNECTION_STATE_ENABLED_TX:
+		if (gb_operation_is_incoming(operation))
+			goto err_unlock;
+		break;
+	case GB_CONNECTION_STATE_DISCONNECTING:
+		if (!gb_operation_is_core(operation))
+			goto err_unlock;
+		break;
+	default:
+		goto err_unlock;
 	}
 
 	if (operation->active++ == 0)
 		list_add_tail(&operation->links, &connection->operations);
 
+	trace_gb_operation_get_active(operation);
+
 	spin_unlock_irqrestore(&connection->lock, flags);
 
 	return 0;
+
+err_unlock:
+	spin_unlock_irqrestore(&connection->lock, flags);
+
+	return -ENOTCONN;
 }
 
 /* Caller holds operation reference. */
@@ -69,6 +83,9 @@ static void gb_operation_put_active(struct gb_operation *operation)
 	unsigned long flags;
 
 	spin_lock_irqsave(&connection->lock, flags);
+
+	trace_gb_operation_put_active(operation);
+
 	if (--operation->active == 0) {
 		list_del(&operation->links);
 		if (atomic_read(&operation->waiters))
@@ -536,6 +553,8 @@ gb_operation_create_flags(struct gb_connection *connection,
 				size_t response_size, unsigned long flags,
 				gfp_t gfp)
 {
+	struct gb_operation *operation;
+
 	if (WARN_ON_ONCE(type == GB_REQUEST_TYPE_INVALID))
 		return NULL;
 	if (WARN_ON_ONCE(type & GB_MESSAGE_TYPE_RESPONSE))
@@ -544,11 +563,35 @@ gb_operation_create_flags(struct gb_connection *connection,
 	if (WARN_ON_ONCE(flags & ~GB_OPERATION_FLAG_USER_MASK))
 		flags &= GB_OPERATION_FLAG_USER_MASK;
 
-	return gb_operation_create_common(connection, type,
+	operation = gb_operation_create_common(connection, type,
 						request_size, response_size,
 						flags, gfp);
+	if (operation)
+		trace_gb_operation_create(operation);
+
+	return operation;
 }
 EXPORT_SYMBOL_GPL(gb_operation_create_flags);
+
+struct gb_operation *
+gb_operation_create_core(struct gb_connection *connection,
+				u8 type, size_t request_size,
+				size_t response_size, unsigned long flags,
+				gfp_t gfp)
+{
+	struct gb_operation *operation;
+
+	flags |= GB_OPERATION_FLAG_CORE;
+
+	operation = gb_operation_create_common(connection, type,
+						request_size, response_size,
+						flags, gfp);
+	if (operation)
+		trace_gb_operation_create_core(operation);
+
+	return operation;
+}
+/* Do not export this function. */
 
 size_t gb_operation_get_payload_size_max(struct gb_connection *connection)
 {
@@ -581,6 +624,7 @@ gb_operation_create_incoming(struct gb_connection *connection, u16 id,
 
 	operation->id = id;
 	memcpy(operation->request->header, data, size);
+	trace_gb_operation_create_incoming(operation);
 
 	return operation;
 }
@@ -602,6 +646,8 @@ static void _gb_operation_destroy(struct kref *kref)
 	struct gb_operation *operation;
 
 	operation = container_of(kref, struct gb_operation, kref);
+
+	trace_gb_operation_destroy(operation);
 
 	if (operation->response)
 		gb_operation_message_free(operation->response);
@@ -653,6 +699,9 @@ int gb_operation_request_send(struct gb_operation *operation,
 	struct gb_operation_msg_hdr *header;
 	unsigned int cycle;
 	int ret;
+
+	if (gb_connection_is_offloaded(connection))
+		return -EBUSY;
 
 	if (!callback)
 		return -EINVAL;
@@ -840,11 +889,16 @@ EXPORT_SYMBOL_GPL(greybus_message_sent);
  * data into the request buffer and handle the rest via workqueue.
  */
 static void gb_connection_recv_request(struct gb_connection *connection,
-				       u16 operation_id, u8 type,
-				       void *data, size_t size)
+				const struct gb_operation_msg_hdr *header,
+				void *data, size_t size)
 {
 	struct gb_operation *operation;
+	u16 operation_id;
+	u8 type;
 	int ret;
+
+	operation_id = le16_to_cpu(header->operation_id);
+	type = header->type;
 
 	operation = gb_operation_create_incoming(connection, operation_id,
 						type, data, size);
@@ -879,16 +933,19 @@ static void gb_connection_recv_request(struct gb_connection *connection,
  * data into the response buffer and handle the rest via workqueue.
  */
 static void gb_connection_recv_response(struct gb_connection *connection,
-			u16 operation_id, u8 result, void *data, size_t size)
+				const struct gb_operation_msg_hdr *header,
+				void *data, size_t size)
 {
-	struct gb_operation_msg_hdr *header;
 	struct gb_operation *operation;
 	struct gb_message *message;
-	int errno = gb_operation_status_map(result);
 	size_t message_size;
+	u16 operation_id;
+	int errno;
+
+	operation_id = le16_to_cpu(header->operation_id);
 
 	if (!operation_id) {
-		dev_err(&connection->hd->dev,
+		dev_err_ratelimited(&connection->hd->dev,
 				"%s: invalid response id 0 received\n",
 				connection->name);
 		return;
@@ -896,17 +953,17 @@ static void gb_connection_recv_response(struct gb_connection *connection,
 
 	operation = gb_operation_find_outgoing(connection, operation_id);
 	if (!operation) {
-		dev_err(&connection->hd->dev,
-			"%s: unexpected response id 0x%04x received\n",
-			connection->name, operation_id);
+		dev_err_ratelimited(&connection->hd->dev,
+				"%s: unexpected response id 0x%04x received\n",
+				connection->name, operation_id);
 		return;
 	}
 
+	errno = gb_operation_status_map(header->result);
 	message = operation->response;
-	header = message->header;
 	message_size = sizeof(*header) + message->payload_size;
 	if (!errno && size > message_size) {
-		dev_err(&connection->hd->dev,
+		dev_err_ratelimited(&connection->hd->dev,
 				"%s: malformed response 0x%02x received (%zu > %zu)\n",
 				connection->name, header->type,
 				size, message_size);
@@ -915,14 +972,13 @@ static void gb_connection_recv_response(struct gb_connection *connection,
 		if (gb_operation_short_response_allowed(operation)) {
 			message->payload_size = size - sizeof(*header);
 		} else {
-			dev_err(&connection->hd->dev,
+			dev_err_ratelimited(&connection->hd->dev,
 					"%s: short response 0x%02x received (%zu < %zu)\n",
 					connection->name, header->type,
 					size, message_size);
 			errno = -EMSGSIZE;
 		}
 	}
-	trace_gb_message_recv_response(operation->response);
 
 	/* We must ignore the payload if a bad status is returned */
 	if (errno)
@@ -930,7 +986,10 @@ static void gb_connection_recv_response(struct gb_connection *connection,
 
 	/* The rest will be handled in work queue context */
 	if (gb_operation_result_set(operation, errno)) {
-		memcpy(header, data, size);
+		memcpy(message->buffer, data, size);
+
+		trace_gb_message_recv_response(message);
+
 		queue_work(gb_operation_completion_wq, &operation->work);
 	}
 
@@ -948,17 +1007,17 @@ void gb_connection_recv(struct gb_connection *connection,
 	struct gb_operation_msg_hdr header;
 	struct device *dev = &connection->hd->dev;
 	size_t msg_size;
-	u16 operation_id;
 
-	if (connection->state != GB_CONNECTION_STATE_ENABLED &&
-		connection->state != GB_CONNECTION_STATE_ENABLED_TX) {
-		dev_warn(dev, "%s: dropping %zu received bytes\n",
+	if (connection->state == GB_CONNECTION_STATE_DISABLED ||
+			gb_connection_is_offloaded(connection)) {
+		dev_warn_ratelimited(dev, "%s: dropping %zu received bytes\n",
 				connection->name, size);
 		return;
 	}
 
 	if (size < sizeof(header)) {
-		dev_err(dev, "%s: short message received\n", connection->name);
+		dev_err_ratelimited(dev, "%s: short message received\n",
+				connection->name);
 		return;
 	}
 
@@ -966,20 +1025,21 @@ void gb_connection_recv(struct gb_connection *connection,
 	memcpy(&header, data, sizeof(header));
 	msg_size = le16_to_cpu(header.size);
 	if (size < msg_size) {
-		dev_err(dev,
-			"%s: incomplete message 0x%04x of type 0x%02x received (%zu < %zu)\n",
-			connection->name, le16_to_cpu(header.operation_id),
-			header.type, size, msg_size);
+		dev_err_ratelimited(dev,
+				"%s: incomplete message 0x%04x of type 0x%02x received (%zu < %zu)\n",
+				connection->name,
+				le16_to_cpu(header.operation_id),
+				header.type, size, msg_size);
 		return;		/* XXX Should still complete operation */
 	}
 
-	operation_id = le16_to_cpu(header.operation_id);
-	if (header.type & GB_MESSAGE_TYPE_RESPONSE)
-		gb_connection_recv_response(connection, operation_id,
-						header.result, data, msg_size);
-	else
-		gb_connection_recv_request(connection, operation_id,
-						header.type, data, msg_size);
+	if (header.type & GB_MESSAGE_TYPE_RESPONSE) {
+		gb_connection_recv_response(connection,	&header, data,
+						msg_size);
+	} else {
+		gb_connection_recv_request(connection, &header, data,
+						msg_size);
+	}
 }
 
 /*
@@ -1077,8 +1137,8 @@ int gb_operation_sync_timeout(struct gb_connection *connection, int type,
 	ret = gb_operation_request_send_sync_timeout(operation, timeout);
 	if (ret) {
 		dev_err(&connection->hd->dev,
-			"%s: synchronous operation of type 0x%02x failed: %d\n",
-			connection->name, type, ret);
+			"%s: synchronous operation id 0x%04x of type 0x%02x failed: %d\n",
+			connection->name, operation->id, type, ret);
 	} else {
 		if (response_size) {
 			memcpy(response, operation->response->payload,

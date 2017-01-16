@@ -8,6 +8,7 @@
  */
 
 #include "greybus.h"
+#include "greybus_trace.h"
 
 
 static ssize_t eject_store(struct device *dev,
@@ -77,6 +78,8 @@ static void gb_module_release(struct device *dev)
 {
 	struct gb_module *module = to_gb_module(dev);
 
+	trace_gb_module_release(module);
+
 	kfree(module);
 }
 
@@ -108,6 +111,8 @@ struct gb_module *gb_module_create(struct gb_host_device *hd, u8 module_id,
 	module->dev.dma_mask = hd->dev.dma_mask;
 	device_initialize(&module->dev);
 	dev_set_name(&module->dev, "%d-%u", hd->bus_id, module_id);
+
+	trace_gb_module_create(module);
 
 	for (i = 0; i < num_interfaces; ++i) {
 		intf = gb_interface_create(module, module_id + i);
@@ -143,8 +148,12 @@ static void gb_module_register_interface(struct gb_interface *intf)
 
 	ret = gb_interface_activate(intf);
 	if (ret) {
-		dev_err(&module->dev, "failed to activate interface %u: %d\n",
-				intf_id, ret);
+		if (intf->type != GB_INTERFACE_TYPE_DUMMY) {
+			dev_err(&module->dev,
+					"failed to activate interface %u: %d\n",
+					intf_id, ret);
+		}
+
 		gb_interface_add(intf);
 		goto err_unlock;
 	}
@@ -177,6 +186,7 @@ static void gb_module_deregister_interface(struct gb_interface *intf)
 		intf->disconnected = true;
 
 	mutex_lock(&intf->mutex);
+	intf->removed = true;
 	gb_interface_disable(intf);
 	gb_interface_deactivate(intf);
 	mutex_unlock(&intf->mutex);
@@ -196,6 +206,8 @@ int gb_module_add(struct gb_module *module)
 		return ret;
 	}
 
+	trace_gb_module_add(module);
+
 	for (i = 0; i < module->num_interfaces; ++i)
 		gb_module_register_interface(module->interfaces[i]);
 
@@ -209,6 +221,8 @@ void gb_module_del(struct gb_module *module)
 
 	for (i = 0; i < module->num_interfaces; ++i)
 		gb_module_deregister_interface(module->interfaces[i]);
+
+	trace_gb_module_del(module);
 
 	device_del(&module->dev);
 }

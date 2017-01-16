@@ -83,22 +83,26 @@ static void do_work(struct work_struct *work)
 		dev_err(&svc->dev,
 			"SVC ping has returned %d, something is wrong!!!\n",
 			retval);
-		dev_err(&svc->dev, "Resetting the greybus network, watch out!!!\n");
 
-		INIT_DELAYED_WORK(&reset_work, greybus_reset);
-		queue_delayed_work(system_wq, &reset_work, HZ/2);
+		if (svc->action == GB_SVC_WATCHDOG_BITE_PANIC_KERNEL) {
+			panic("SVC is not responding\n");
+		} else if (svc->action == GB_SVC_WATCHDOG_BITE_RESET_UNIPRO) {
+			dev_err(&svc->dev, "Resetting the greybus network, watch out!!!\n");
 
-		/*
-		 * Disable ourselves, we don't want to trip again unless
-		 * userspace wants us to.
-		 */
-		watchdog->enabled = false;
+			INIT_DELAYED_WORK(&reset_work, greybus_reset);
+			schedule_delayed_work(&reset_work, HZ / 2);
+
+			/*
+			 * Disable ourselves, we don't want to trip again unless
+			 * userspace wants us to.
+			 */
+			watchdog->enabled = false;
+		}
 	}
 
 	/* resubmit our work to happen again, if we are still "alive" */
 	if (watchdog->enabled)
-		queue_delayed_work(system_wq, &watchdog->work,
-				   SVC_WATCHDOG_PERIOD);
+		schedule_delayed_work(&watchdog->work, SVC_WATCHDOG_PERIOD);
 }
 
 int gb_svc_watchdog_create(struct gb_svc *svc)
@@ -173,8 +177,7 @@ int gb_svc_watchdog_enable(struct gb_svc *svc)
 		return 0;
 
 	watchdog->enabled = true;
-	queue_delayed_work(system_wq, &watchdog->work,
-			   SVC_WATCHDOG_PERIOD);
+	schedule_delayed_work(&watchdog->work, SVC_WATCHDOG_PERIOD);
 	return 0;
 }
 

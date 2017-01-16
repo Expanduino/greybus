@@ -18,6 +18,7 @@
 #include <linux/slab.h>
 #include <linux/device.h>
 #include <linux/module.h>
+#include <linux/pm_runtime.h>
 #include <linux/idr.h>
 
 #include "kernel_ver.h"
@@ -32,9 +33,8 @@
 #include "interface.h"
 #include "bundle.h"
 #include "connection.h"
-#include "protocol.h"
 #include "operation.h"
-
+#include "timesync.h"
 
 /* Matches up with the Greybus Protocol specification document */
 #define GREYBUS_VERSION_MAJOR	0x00
@@ -62,9 +62,6 @@ struct greybus_driver {
 	int (*probe)(struct gb_bundle *bundle,
 		     const struct greybus_bundle_id *id);
 	void (*disconnect)(struct gb_bundle *bundle);
-
-	int (*suspend)(struct gb_bundle *bundle, pm_message_t message);
-	int (*resume)(struct gb_bundle *bundle);
 
 	const struct greybus_bundle_id *id_table;
 

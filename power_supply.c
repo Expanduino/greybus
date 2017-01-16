@@ -18,8 +18,9 @@
 
 struct gb_power_supply_prop {
 	enum power_supply_property	prop;
-	u32				val;
-	u32				previous_val;
+	u8				gb_prop;
+	int				val;
+	int				previous_val;
 	bool				is_writeable;
 };
 
@@ -44,10 +45,13 @@ struct gb_power_supply {
 	u8				properties_count;
 	u8				properties_count_str;
 	unsigned long			last_update;
+	u8				cache_invalid;
 	unsigned int			update_interval;
 	bool				changed;
 	struct gb_power_supply_prop	*props;
 	enum power_supply_property	*props_raw;
+	bool				pm_acquired;
+	struct mutex			supply_lock;
 };
 
 struct gb_power_supplies {
@@ -69,19 +73,231 @@ static unsigned int update_interval_max = 30 * HZ;
 struct gb_power_supply_changes {
 	enum power_supply_property	prop;
 	u32				tolerance_change;
+	void (*prop_changed)(struct gb_power_supply *gbpsy,
+			     struct gb_power_supply_prop *prop);
 };
 
+static void gb_power_supply_state_change(struct gb_power_supply *gbpsy,
+					 struct gb_power_supply_prop *prop);
+
 static const struct gb_power_supply_changes psy_props_changes[] = {
-	{	.prop =			GB_POWER_SUPPLY_PROP_STATUS,
-		.tolerance_change =	0,
+	{	.prop			= GB_POWER_SUPPLY_PROP_STATUS,
+		.tolerance_change	= 0,
+		.prop_changed		= gb_power_supply_state_change,
 	},
-	{	.prop =			GB_POWER_SUPPLY_PROP_TEMP,
-		.tolerance_change =	500,
+	{	.prop			= GB_POWER_SUPPLY_PROP_TEMP,
+		.tolerance_change	= 500,
+		.prop_changed		= NULL,
 	},
-	{	.prop =			GB_POWER_SUPPLY_PROP_ONLINE,
-		.tolerance_change =	0,
+	{	.prop			= GB_POWER_SUPPLY_PROP_ONLINE,
+		.tolerance_change	= 0,
+		.prop_changed		= NULL,
 	},
 };
+
+static int get_psp_from_gb_prop(int gb_prop, enum power_supply_property *psp)
+{
+	int prop;
+
+	switch (gb_prop) {
+	case GB_POWER_SUPPLY_PROP_STATUS:
+		prop = POWER_SUPPLY_PROP_STATUS;
+		break;
+	case GB_POWER_SUPPLY_PROP_CHARGE_TYPE:
+		prop = POWER_SUPPLY_PROP_CHARGE_TYPE;
+		break;
+	case GB_POWER_SUPPLY_PROP_HEALTH:
+		prop = POWER_SUPPLY_PROP_HEALTH;
+		break;
+	case GB_POWER_SUPPLY_PROP_PRESENT:
+		prop = POWER_SUPPLY_PROP_PRESENT;
+		break;
+	case GB_POWER_SUPPLY_PROP_ONLINE:
+		prop = POWER_SUPPLY_PROP_ONLINE;
+		break;
+	case GB_POWER_SUPPLY_PROP_AUTHENTIC:
+		prop = POWER_SUPPLY_PROP_AUTHENTIC;
+		break;
+	case GB_POWER_SUPPLY_PROP_TECHNOLOGY:
+		prop = POWER_SUPPLY_PROP_TECHNOLOGY;
+		break;
+	case GB_POWER_SUPPLY_PROP_CYCLE_COUNT:
+		prop = POWER_SUPPLY_PROP_CYCLE_COUNT;
+		break;
+	case GB_POWER_SUPPLY_PROP_VOLTAGE_MAX:
+		prop = POWER_SUPPLY_PROP_VOLTAGE_MAX;
+		break;
+	case GB_POWER_SUPPLY_PROP_VOLTAGE_MIN:
+		prop = POWER_SUPPLY_PROP_VOLTAGE_MIN;
+		break;
+	case GB_POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN:
+		prop = POWER_SUPPLY_PROP_VOLTAGE_MAX_DESIGN;
+		break;
+	case GB_POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN:
+		prop = POWER_SUPPLY_PROP_VOLTAGE_MIN_DESIGN;
+		break;
+	case GB_POWER_SUPPLY_PROP_VOLTAGE_NOW:
+		prop = POWER_SUPPLY_PROP_VOLTAGE_NOW;
+		break;
+	case GB_POWER_SUPPLY_PROP_VOLTAGE_AVG:
+		prop = POWER_SUPPLY_PROP_VOLTAGE_AVG;
+		break;
+	case GB_POWER_SUPPLY_PROP_VOLTAGE_OCV:
+		prop = POWER_SUPPLY_PROP_VOLTAGE_OCV;
+		break;
+	case GB_POWER_SUPPLY_PROP_VOLTAGE_BOOT:
+		prop = POWER_SUPPLY_PROP_VOLTAGE_BOOT;
+		break;
+	case GB_POWER_SUPPLY_PROP_CURRENT_MAX:
+		prop = POWER_SUPPLY_PROP_CURRENT_MAX;
+		break;
+	case GB_POWER_SUPPLY_PROP_CURRENT_NOW:
+		prop = POWER_SUPPLY_PROP_CURRENT_NOW;
+		break;
+	case GB_POWER_SUPPLY_PROP_CURRENT_AVG:
+		prop = POWER_SUPPLY_PROP_CURRENT_AVG;
+		break;
+	case GB_POWER_SUPPLY_PROP_CURRENT_BOOT:
+		prop = POWER_SUPPLY_PROP_CURRENT_BOOT;
+		break;
+	case GB_POWER_SUPPLY_PROP_POWER_NOW:
+		prop = POWER_SUPPLY_PROP_POWER_NOW;
+		break;
+	case GB_POWER_SUPPLY_PROP_POWER_AVG:
+		prop = POWER_SUPPLY_PROP_POWER_AVG;
+		break;
+	case GB_POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN:
+		prop = POWER_SUPPLY_PROP_CHARGE_FULL_DESIGN;
+		break;
+	case GB_POWER_SUPPLY_PROP_CHARGE_EMPTY_DESIGN:
+		prop = POWER_SUPPLY_PROP_CHARGE_EMPTY_DESIGN;
+		break;
+	case GB_POWER_SUPPLY_PROP_CHARGE_FULL:
+		prop = POWER_SUPPLY_PROP_CHARGE_FULL;
+		break;
+	case GB_POWER_SUPPLY_PROP_CHARGE_EMPTY:
+		prop = POWER_SUPPLY_PROP_CHARGE_EMPTY;
+		break;
+	case GB_POWER_SUPPLY_PROP_CHARGE_NOW:
+		prop = POWER_SUPPLY_PROP_CHARGE_NOW;
+		break;
+	case GB_POWER_SUPPLY_PROP_CHARGE_AVG:
+		prop = POWER_SUPPLY_PROP_CHARGE_AVG;
+		break;
+	case GB_POWER_SUPPLY_PROP_CHARGE_COUNTER:
+		prop = POWER_SUPPLY_PROP_CHARGE_COUNTER;
+		break;
+	case GB_POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT:
+		prop = POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT;
+		break;
+	case GB_POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX:
+		prop = POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX;
+		break;
+	case GB_POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE:
+		prop = POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE;
+		break;
+	case GB_POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX:
+		prop = POWER_SUPPLY_PROP_CONSTANT_CHARGE_VOLTAGE_MAX;
+		break;
+	case GB_POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT:
+		prop = POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT;
+		break;
+	case GB_POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX:
+		prop = POWER_SUPPLY_PROP_CHARGE_CONTROL_LIMIT_MAX;
+		break;
+	case GB_POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT:
+		prop = POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT;
+		break;
+	case GB_POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN:
+		prop = POWER_SUPPLY_PROP_ENERGY_FULL_DESIGN;
+		break;
+	case GB_POWER_SUPPLY_PROP_ENERGY_EMPTY_DESIGN:
+		prop = POWER_SUPPLY_PROP_ENERGY_EMPTY_DESIGN;
+		break;
+	case GB_POWER_SUPPLY_PROP_ENERGY_FULL:
+		prop = POWER_SUPPLY_PROP_ENERGY_FULL;
+		break;
+	case GB_POWER_SUPPLY_PROP_ENERGY_EMPTY:
+		prop = POWER_SUPPLY_PROP_ENERGY_EMPTY;
+		break;
+	case GB_POWER_SUPPLY_PROP_ENERGY_NOW:
+		prop = POWER_SUPPLY_PROP_ENERGY_NOW;
+		break;
+	case GB_POWER_SUPPLY_PROP_ENERGY_AVG:
+		prop = POWER_SUPPLY_PROP_ENERGY_AVG;
+		break;
+	case GB_POWER_SUPPLY_PROP_CAPACITY:
+		prop = POWER_SUPPLY_PROP_CAPACITY;
+		break;
+	case GB_POWER_SUPPLY_PROP_CAPACITY_ALERT_MIN:
+		prop = POWER_SUPPLY_PROP_CAPACITY_ALERT_MIN;
+		break;
+	case GB_POWER_SUPPLY_PROP_CAPACITY_ALERT_MAX:
+		prop = POWER_SUPPLY_PROP_CAPACITY_ALERT_MAX;
+		break;
+	case GB_POWER_SUPPLY_PROP_CAPACITY_LEVEL:
+		prop = POWER_SUPPLY_PROP_CAPACITY_LEVEL;
+		break;
+	case GB_POWER_SUPPLY_PROP_TEMP:
+		prop = POWER_SUPPLY_PROP_TEMP;
+		break;
+	case GB_POWER_SUPPLY_PROP_TEMP_MAX:
+		prop = POWER_SUPPLY_PROP_TEMP_MAX;
+		break;
+	case GB_POWER_SUPPLY_PROP_TEMP_MIN:
+		prop = POWER_SUPPLY_PROP_TEMP_MIN;
+		break;
+	case GB_POWER_SUPPLY_PROP_TEMP_ALERT_MIN:
+		prop = POWER_SUPPLY_PROP_TEMP_ALERT_MIN;
+		break;
+	case GB_POWER_SUPPLY_PROP_TEMP_ALERT_MAX:
+		prop = POWER_SUPPLY_PROP_TEMP_ALERT_MAX;
+		break;
+	case GB_POWER_SUPPLY_PROP_TEMP_AMBIENT:
+		prop = POWER_SUPPLY_PROP_TEMP_AMBIENT;
+		break;
+	case GB_POWER_SUPPLY_PROP_TEMP_AMBIENT_ALERT_MIN:
+		prop = POWER_SUPPLY_PROP_TEMP_AMBIENT_ALERT_MIN;
+		break;
+	case GB_POWER_SUPPLY_PROP_TEMP_AMBIENT_ALERT_MAX:
+		prop = POWER_SUPPLY_PROP_TEMP_AMBIENT_ALERT_MAX;
+		break;
+	case GB_POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW:
+		prop = POWER_SUPPLY_PROP_TIME_TO_EMPTY_NOW;
+		break;
+	case GB_POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG:
+		prop = POWER_SUPPLY_PROP_TIME_TO_EMPTY_AVG;
+		break;
+	case GB_POWER_SUPPLY_PROP_TIME_TO_FULL_NOW:
+		prop = POWER_SUPPLY_PROP_TIME_TO_FULL_NOW;
+		break;
+	case GB_POWER_SUPPLY_PROP_TIME_TO_FULL_AVG:
+		prop = POWER_SUPPLY_PROP_TIME_TO_FULL_AVG;
+		break;
+	case GB_POWER_SUPPLY_PROP_TYPE:
+		prop = POWER_SUPPLY_PROP_TYPE;
+		break;
+	case GB_POWER_SUPPLY_PROP_SCOPE:
+		prop = POWER_SUPPLY_PROP_SCOPE;
+		break;
+	case GB_POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT:
+		prop = POWER_SUPPLY_PROP_CHARGE_TERM_CURRENT;
+		break;
+	case GB_POWER_SUPPLY_PROP_CALIBRATE:
+		prop = POWER_SUPPLY_PROP_CALIBRATE;
+		break;
+	default:
+		prop = -1;
+		break;
+	}
+
+	if (prop < 0)
+		return prop;
+
+	*psp = (enum power_supply_property)prop;
+
+	return 0;
+}
 
 static struct gb_connection *get_conn_from_psy(struct gb_power_supply *gbpsy)
 {
@@ -138,24 +354,65 @@ static void __gb_power_supply_changed(struct gb_power_supply *gbpsy)
 }
 #endif
 
+static void gb_power_supply_state_change(struct gb_power_supply *gbpsy,
+					 struct gb_power_supply_prop *prop)
+{
+	struct gb_connection *connection = get_conn_from_psy(gbpsy);
+	int ret;
+
+	/*
+	 * Check gbpsy->pm_acquired to make sure only one pair of 'get_sync'
+	 * and 'put_autosuspend' runtime pm call for state property change.
+	 */
+	mutex_lock(&gbpsy->supply_lock);
+
+	if ((prop->val == GB_POWER_SUPPLY_STATUS_CHARGING) &&
+	    !gbpsy->pm_acquired) {
+		ret = gb_pm_runtime_get_sync(connection->bundle);
+		if (ret)
+			dev_err(&connection->bundle->dev,
+				"Fail to set wake lock for charging state\n");
+		else
+			gbpsy->pm_acquired = true;
+	} else {
+		if (gbpsy->pm_acquired) {
+			ret = gb_pm_runtime_put_autosuspend(connection->bundle);
+			if (ret)
+				dev_err(&connection->bundle->dev,
+					"Fail to set wake unlock for none charging\n");
+			else
+				gbpsy->pm_acquired = false;
+		}
+	}
+
+	mutex_unlock(&gbpsy->supply_lock);
+}
+
 static void check_changed(struct gb_power_supply *gbpsy,
 			  struct gb_power_supply_prop *prop)
 {
 	const struct gb_power_supply_changes *psyc;
-	u32 val = prop->val;
-	u32 prev_val = prop->previous_val;
+	int val = prop->val;
+	int prev_val = prop->previous_val;
+	bool changed = false;
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(psy_props_changes); i++) {
 		psyc = &psy_props_changes[i];
 		if (prop->prop == psyc->prop) {
 			if (!psyc->tolerance_change)
-				gbpsy->changed = true;
+				changed = true;
 			else if (val < prev_val &&
 				 prev_val - val > psyc->tolerance_change)
-				gbpsy->changed = true;
+				changed = true;
 			else if (val > prev_val &&
 				 val - prev_val > psyc->tolerance_change)
+				changed = true;
+
+			if (changed && psyc->prop_changed)
+				psyc->prop_changed(gbpsy, prop);
+
+			if (changed)
 				gbpsy->changed = true;
 			break;
 		}
@@ -253,8 +510,9 @@ static int gb_power_supply_prop_descriptors_get(struct gb_power_supply *gbpsy)
 	struct gb_power_supply_get_property_descriptors_response *resp;
 	struct gb_operation *op;
 	u8 props_count = gbpsy->properties_count;
+	enum power_supply_property psp;
 	int ret;
-	int i;
+	int i, r = 0;
 
 	if (props_count == 0)
 		return 0;
@@ -276,6 +534,17 @@ static int gb_power_supply_prop_descriptors_get(struct gb_power_supply *gbpsy)
 
 	resp = op->response->payload;
 
+	/* validate received properties */
+	for (i = 0; i < props_count; i++) {
+		ret = get_psp_from_gb_prop(resp->props[i].property, &psp);
+		if (ret < 0) {
+			dev_warn(&connection->bundle->dev,
+				 "greybus property %u it is not supported by this kernel, dropped\n",
+				 resp->props[i].property);
+			gbpsy->properties_count--;
+		}
+	}
+
 	gbpsy->props = kcalloc(gbpsy->properties_count, sizeof(*gbpsy->props),
 			      GFP_KERNEL);
 	if (!gbpsy->props) {
@@ -290,13 +559,18 @@ static int gb_power_supply_prop_descriptors_get(struct gb_power_supply *gbpsy)
 		goto out_put_operation;
 	}
 
-
-	/* Store available properties */
-	for (i = 0; i < gbpsy->properties_count; i++) {
-		gbpsy->props[i].prop = resp->props[i].property;
-		gbpsy->props_raw[i] = resp->props[i].property;
+	/* Store available properties, skip the ones we do not support */
+	for (i = 0; i < props_count; i++) {
+		ret = get_psp_from_gb_prop(resp->props[i].property, &psp);
+		if (ret < 0) {
+			r++;
+			continue;
+		}
+		gbpsy->props[i - r].prop = psp;
+		gbpsy->props[i - r].gb_prop = resp->props[i].property;
+		gbpsy->props_raw[i - r] = psp;
 		if (resp->props[i].is_writeable)
-			gbpsy->props[i].is_writeable = true;
+			gbpsy->props[i - r].is_writeable = true;
 	}
 
 	/*
@@ -305,6 +579,7 @@ static int gb_power_supply_prop_descriptors_get(struct gb_power_supply *gbpsy)
 	 */
 	_gb_power_supply_append_props(gbpsy);
 
+	ret = 0;
 out_put_operation:
 	gb_operation_put(op);
 
@@ -318,14 +593,14 @@ static int __gb_power_supply_property_update(struct gb_power_supply *gbpsy,
 	struct gb_power_supply_prop *prop;
 	struct gb_power_supply_get_property_request req;
 	struct gb_power_supply_get_property_response resp;
-	u32 val;
+	int val;
 	int ret;
 
 	prop = get_psy_prop(gbpsy, psp);
 	if (!prop)
 		return -EINVAL;
 	req.psy_id = gbpsy->id;
-	req.property = (u8)psp;
+	req.property = prop->gb_prop;
 
 	ret = gb_operation_sync(connection, GB_POWER_SUPPLY_TYPE_GET_PROPERTY,
 				&req, sizeof(req), &resp, sizeof(resp));
@@ -401,16 +676,34 @@ static int _gb_power_supply_property_get(struct gb_power_supply *gbpsy,
 	return 0;
 }
 
-static int gb_power_supply_status_get(struct gb_power_supply *gbpsy)
+static int is_cache_valid(struct gb_power_supply *gbpsy)
 {
-	int ret = 0;
-	int i;
+	/* check if cache is good enough or it has expired */
+	if (gbpsy->cache_invalid) {
+		gbpsy->cache_invalid = 0;
+		return 0;
+	}
 
-	/* check if cache is good enough */
 	if (gbpsy->last_update &&
 	    time_is_after_jiffies(gbpsy->last_update +
 				  msecs_to_jiffies(cache_time)))
+		return 1;
+
+	return 0;
+}
+
+static int gb_power_supply_status_get(struct gb_power_supply *gbpsy)
+{
+	struct gb_connection *connection = get_conn_from_psy(gbpsy);
+	int ret = 0;
+	int i;
+
+	if (is_cache_valid(gbpsy))
 		return 0;
+
+	ret = gb_pm_runtime_get_sync(connection->bundle);
+	if (ret)
+		return ret;
 
 	for (i = 0; i < gbpsy->properties_count; i++) {
 		ret = __gb_power_supply_property_update(gbpsy,
@@ -422,6 +715,7 @@ static int gb_power_supply_status_get(struct gb_power_supply *gbpsy)
 	if (ret == 0)
 		gbpsy->last_update = jiffies;
 
+	gb_pm_runtime_put_autosuspend(connection->bundle);
 	return ret;
 }
 
@@ -476,12 +770,19 @@ static int gb_power_supply_property_set(struct gb_power_supply *gbpsy,
 	struct gb_power_supply_set_property_request req;
 	int ret;
 
+	ret = gb_pm_runtime_get_sync(connection->bundle);
+	if (ret)
+		return ret;
+
 	prop = get_psy_prop(gbpsy, psp);
-	if (!prop)
-		return -EINVAL;
+	if (!prop) {
+		ret = -EINVAL;
+		goto out;
+	}
+
 	req.psy_id = gbpsy->id;
-	req.property = (u8)psp;
-	req.prop_val = cpu_to_le32(val);
+	req.property = prop->gb_prop;
+	req.prop_val = cpu_to_le32((s32)val);
 
 	ret = gb_operation_sync(connection, GB_POWER_SUPPLY_TYPE_SET_PROPERTY,
 				&req, sizeof(req), NULL, 0);
@@ -492,6 +793,7 @@ static int gb_power_supply_property_set(struct gb_power_supply *gbpsy,
 	prop->val = val;
 
 out:
+	gb_pm_runtime_put_autosuspend(connection->bundle);
 	return ret;
 }
 
@@ -511,7 +813,6 @@ static int property_is_writeable(struct power_supply *b,
 
 	return is_psy_prop_writeable(gbpsy, psp);
 }
-
 
 #ifndef CORE_OWNS_PSY_STRUCT
 static int gb_power_supply_register(struct gb_power_supply *gbpsy)
@@ -547,10 +848,7 @@ static int gb_power_supply_register(struct gb_power_supply *gbpsy)
 
 	gbpsy->psy = power_supply_register(&connection->bundle->dev,
 					   &gbpsy->desc, &cfg);
-	if (IS_ERR(gbpsy->psy))
-		return PTR_ERR(gbpsy->psy);
-
-	return 0;
+	return PTR_ERR_OR_ZERO(gbpsy->psy);
 }
 #endif
 
@@ -565,7 +863,6 @@ static void _gb_power_supply_free(struct gb_power_supply *gbpsy)
 
 static void _gb_power_supply_release(struct gb_power_supply *gbpsy)
 {
-
 	gbpsy->update_interval = 0;
 
 	cancel_delayed_work_sync(&gbpsy->work);
@@ -626,18 +923,20 @@ static int gb_power_supply_config(struct gb_power_supplies *supplies, int id)
 	if (ret < 0)
 		return ret;
 
-	ret = gb_power_supply_prop_descriptors_get(gbpsy);
-	if (ret < 0)
-		return ret;
-
-	/* guarantee that we have an unique name, before register */
-	return __gb_power_supply_set_name(gbpsy->model_name, gbpsy->name,
-					  sizeof(gbpsy->name));
+	return gb_power_supply_prop_descriptors_get(gbpsy);
 }
 
 static int gb_power_supply_enable(struct gb_power_supply *gbpsy)
 {
 	int ret;
+
+	/* guarantee that we have an unique name, before register */
+	ret =  __gb_power_supply_set_name(gbpsy->model_name, gbpsy->name,
+					  sizeof(gbpsy->name));
+	if (ret < 0)
+		return ret;
+
+	mutex_init(&gbpsy->supply_lock);
 
 	ret = gb_power_supply_register(gbpsy);
 	if (ret < 0)
@@ -752,13 +1051,20 @@ static int gb_supplies_request_handler(struct gb_operation *op)
 	 * running. For that just check update_interval.
 	 */
 	gbpsy = &supplies->supply[psy_id];
-	if (gbpsy->update_interval) {
+	if (!gbpsy->update_interval) {
 		ret = -ESHUTDOWN;
 		goto out_unlock;
 	}
 
-	if (event & GB_POWER_SUPPLY_UPDATE)
+	if (event & GB_POWER_SUPPLY_UPDATE) {
+		/*
+		 * we need to make sure we invalidate cache, if not no new
+		 * values for the properties will be fetch and the all propose
+		 * of this event is missed
+		 */
+		gbpsy->cache_invalid = 1;
 		gb_power_supply_status_update(gbpsy);
+	}
 
 out_unlock:
 	mutex_unlock(&supplies->supplies_lock);
@@ -816,6 +1122,7 @@ static int gb_power_supply_probe(struct gb_bundle *bundle,
 	if (ret < 0)
 		goto error_connection_disable;
 
+	gb_pm_runtime_put_autosuspend(bundle);
 	return 0;
 
 error_connection_disable:

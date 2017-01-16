@@ -13,7 +13,7 @@
 #include <linux/pwm.h>
 
 #include "greybus.h"
-#include "gpbridge.h"
+#include "gbphy.h"
 
 struct gb_pwm_chip {
 	struct gb_connection	*connection;
@@ -43,32 +43,58 @@ static int gb_pwm_activate_operation(struct gb_pwm_chip *pwmc,
 				     u8 which)
 {
 	struct gb_pwm_activate_request request;
+	struct gbphy_device *gbphy_dev;
+	int ret;
 
 	if (which > pwmc->pwm_max)
 		return -EINVAL;
 
 	request.which = which;
-	return gb_operation_sync(pwmc->connection, GB_PWM_TYPE_ACTIVATE,
-				 &request, sizeof(request), NULL, 0);
+
+	gbphy_dev = to_gbphy_dev(pwmc->chip.dev);
+	ret = gbphy_runtime_get_sync(gbphy_dev);
+	if (ret)
+		return ret;
+
+	ret = gb_operation_sync(pwmc->connection, GB_PWM_TYPE_ACTIVATE,
+				&request, sizeof(request), NULL, 0);
+
+	gbphy_runtime_put_autosuspend(gbphy_dev);
+
+	return ret;
 }
 
 static int gb_pwm_deactivate_operation(struct gb_pwm_chip *pwmc,
 				       u8 which)
 {
 	struct gb_pwm_deactivate_request request;
+	struct gbphy_device *gbphy_dev;
+	int ret;
 
 	if (which > pwmc->pwm_max)
 		return -EINVAL;
 
 	request.which = which;
-	return gb_operation_sync(pwmc->connection, GB_PWM_TYPE_DEACTIVATE,
-				 &request, sizeof(request), NULL, 0);
+
+	gbphy_dev = to_gbphy_dev(pwmc->chip.dev);
+	ret = gbphy_runtime_get_sync(gbphy_dev);
+	if (ret)
+		return ret;
+
+	ret = gb_operation_sync(pwmc->connection, GB_PWM_TYPE_DEACTIVATE,
+				&request, sizeof(request), NULL, 0);
+
+	gbphy_runtime_put_autosuspend(gbphy_dev);
+
+	return ret;
 }
 
 static int gb_pwm_config_operation(struct gb_pwm_chip *pwmc,
 				   u8 which, u32 duty, u32 period)
 {
 	struct gb_pwm_config_request request;
+	struct gbphy_device *gbphy_dev;
+	int ret;
 
 	if (which > pwmc->pwm_max)
 		return -EINVAL;
@@ -76,49 +102,90 @@ static int gb_pwm_config_operation(struct gb_pwm_chip *pwmc,
 	request.which = which;
 	request.duty = cpu_to_le32(duty);
 	request.period = cpu_to_le32(period);
-	return gb_operation_sync(pwmc->connection, GB_PWM_TYPE_CONFIG,
-				 &request, sizeof(request), NULL, 0);
-}
 
+	gbphy_dev = to_gbphy_dev(pwmc->chip.dev);
+	ret = gbphy_runtime_get_sync(gbphy_dev);
+	if (ret)
+		return ret;
+
+	ret = gb_operation_sync(pwmc->connection, GB_PWM_TYPE_CONFIG,
+				&request, sizeof(request), NULL, 0);
+
+	gbphy_runtime_put_autosuspend(gbphy_dev);
+
+	return ret;
+}
 
 static int gb_pwm_set_polarity_operation(struct gb_pwm_chip *pwmc,
 					 u8 which, u8 polarity)
 {
 	struct gb_pwm_polarity_request request;
+	struct gbphy_device *gbphy_dev;
+	int ret;
 
 	if (which > pwmc->pwm_max)
 		return -EINVAL;
 
 	request.which = which;
 	request.polarity = polarity;
-	return gb_operation_sync(pwmc->connection, GB_PWM_TYPE_POLARITY,
-				 &request, sizeof(request), NULL, 0);
+
+	gbphy_dev = to_gbphy_dev(pwmc->chip.dev);
+	ret = gbphy_runtime_get_sync(gbphy_dev);
+	if (ret)
+		return ret;
+
+	ret = gb_operation_sync(pwmc->connection, GB_PWM_TYPE_POLARITY,
+				&request, sizeof(request), NULL, 0);
+
+	gbphy_runtime_put_autosuspend(gbphy_dev);
+
+	return ret;
 }
 
 static int gb_pwm_enable_operation(struct gb_pwm_chip *pwmc,
 				   u8 which)
 {
 	struct gb_pwm_enable_request request;
+	struct gbphy_device *gbphy_dev;
+	int ret;
 
 	if (which > pwmc->pwm_max)
 		return -EINVAL;
 
 	request.which = which;
-	return gb_operation_sync(pwmc->connection, GB_PWM_TYPE_ENABLE,
-				 &request, sizeof(request), NULL, 0);
+
+	gbphy_dev = to_gbphy_dev(pwmc->chip.dev);
+	ret = gbphy_runtime_get_sync(gbphy_dev);
+	if (ret)
+		return ret;
+
+	ret = gb_operation_sync(pwmc->connection, GB_PWM_TYPE_ENABLE,
+				&request, sizeof(request), NULL, 0);
+	if (ret)
+		gbphy_runtime_put_autosuspend(gbphy_dev);
+
+	return ret;
 }
 
 static int gb_pwm_disable_operation(struct gb_pwm_chip *pwmc,
 				    u8 which)
 {
 	struct gb_pwm_disable_request request;
+	struct gbphy_device *gbphy_dev;
+	int ret;
 
 	if (which > pwmc->pwm_max)
 		return -EINVAL;
 
 	request.which = which;
-	return gb_operation_sync(pwmc->connection, GB_PWM_TYPE_DISABLE,
-				 &request, sizeof(request), NULL, 0);
+
+	ret = gb_operation_sync(pwmc->connection, GB_PWM_TYPE_DISABLE,
+				&request, sizeof(request), NULL, 0);
+
+	gbphy_dev = to_gbphy_dev(pwmc->chip.dev);
+	gbphy_runtime_put_autosuspend(gbphy_dev);
+
+	return ret;
 }
 
 static int gb_pwm_request(struct pwm_chip *chip, struct pwm_device *pwm)
@@ -132,7 +199,7 @@ static void gb_pwm_free(struct pwm_chip *chip, struct pwm_device *pwm)
 {
 	struct gb_pwm_chip *pwmc = pwm_chip_to_gb_pwm_chip(chip);
 
-	if (test_bit(PWMF_ENABLED, &pwm->flags))
+	if (pwm_is_enabled(pwm))
 		dev_warn(chip->dev, "freeing PWM device without disabling\n");
 
 	gb_pwm_deactivate_operation(pwmc, pwm->hwpwm);
@@ -178,8 +245,8 @@ static const struct pwm_ops gb_pwm_ops = {
 	.owner = THIS_MODULE,
 };
 
-static int gb_pwm_probe(struct gpbridge_device *gpbdev,
-			const struct gpbridge_device_id *id)
+static int gb_pwm_probe(struct gbphy_device *gbphy_dev,
+			const struct gbphy_device_id *id)
 {
 	struct gb_connection *connection;
 	struct gb_pwm_chip *pwmc;
@@ -190,8 +257,8 @@ static int gb_pwm_probe(struct gpbridge_device *gpbdev,
 	if (!pwmc)
 		return -ENOMEM;
 
-	connection = gb_connection_create(gpbdev->bundle,
-					  le16_to_cpu(gpbdev->cport_desc->id),
+	connection = gb_connection_create(gbphy_dev->bundle,
+					  le16_to_cpu(gbphy_dev->cport_desc->id),
 					  NULL);
 	if (IS_ERR(connection)) {
 		ret = PTR_ERR(connection);
@@ -200,15 +267,11 @@ static int gb_pwm_probe(struct gpbridge_device *gpbdev,
 
 	pwmc->connection = connection;
 	gb_connection_set_data(connection, pwmc);
-	gb_gpbridge_set_data(gpbdev, pwmc);
+	gb_gbphy_set_data(gbphy_dev, pwmc);
 
 	ret = gb_connection_enable(connection);
 	if (ret)
 		goto exit_connection_destroy;
-
-	ret = gb_gpbridge_get_version(connection);
-	if (ret)
-		goto exit_connection_disable;
 
 	/* Query number of pwms present */
 	ret = gb_pwm_count_operation(pwmc);
@@ -217,7 +280,7 @@ static int gb_pwm_probe(struct gpbridge_device *gpbdev,
 
 	pwm = &pwmc->chip;
 
-	pwm->dev = &gpbdev->dev;
+	pwm->dev = &gbphy_dev->dev;
 	pwm->ops = &gb_pwm_ops;
 	pwm->base = -1;			/* Allocate base dynamically */
 	pwm->npwm = pwmc->pwm_max + 1;
@@ -225,11 +288,12 @@ static int gb_pwm_probe(struct gpbridge_device *gpbdev,
 
 	ret = pwmchip_add(pwm);
 	if (ret) {
-		dev_err(&gpbdev->dev,
+		dev_err(&gbphy_dev->dev,
 			"failed to register PWM: %d\n", ret);
 		goto exit_connection_disable;
 	}
 
+	gbphy_runtime_put_autosuspend(gbphy_dev);
 	return 0;
 
 exit_connection_disable:
@@ -241,10 +305,15 @@ exit_pwmc_free:
 	return ret;
 }
 
-static void gb_pwm_remove(struct gpbridge_device *gpbdev)
+static void gb_pwm_remove(struct gbphy_device *gbphy_dev)
 {
-	struct gb_pwm_chip *pwmc = gb_gpbridge_get_data(gpbdev);
+	struct gb_pwm_chip *pwmc = gb_gbphy_get_data(gbphy_dev);
 	struct gb_connection *connection = pwmc->connection;
+	int ret;
+
+	ret = gbphy_runtime_get_sync(gbphy_dev);
+	if (ret)
+		gbphy_runtime_get_noresume(gbphy_dev);
 
 	pwmchip_remove(&pwmc->chip);
 	gb_connection_disable(connection);
@@ -252,15 +321,18 @@ static void gb_pwm_remove(struct gpbridge_device *gpbdev)
 	kfree(pwmc);
 }
 
-static const struct gpbridge_device_id gb_pwm_id_table[] = {
-	{ GPBRIDGE_PROTOCOL(GREYBUS_PROTOCOL_PWM) },
+static const struct gbphy_device_id gb_pwm_id_table[] = {
+	{ GBPHY_PROTOCOL(GREYBUS_PROTOCOL_PWM) },
 	{ },
 };
+MODULE_DEVICE_TABLE(gbphy, gb_pwm_id_table);
 
-static struct gpbridge_driver pwm_driver = {
+static struct gbphy_driver pwm_driver = {
 	.name		= "pwm",
 	.probe		= gb_pwm_probe,
 	.remove		= gb_pwm_remove,
 	.id_table	= gb_pwm_id_table,
 };
-gb_gpbridge_builtin_driver(pwm_driver);
+
+module_gbphy_driver(pwm_driver);
+MODULE_LICENSE("GPL v2");

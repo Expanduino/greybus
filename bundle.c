@@ -8,6 +8,7 @@
  */
 
 #include "greybus.h"
+#include "greybus_trace.h"
 
 static ssize_t bundle_class_show(struct device *dev,
 				 struct device_attribute *attr, char *buf)
@@ -55,7 +56,6 @@ static ssize_t state_store(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RW(state);
 
-
 static struct attribute *bundle_attrs[] = {
 	&dev_attr_bundle_class.attr,
 	&dev_attr_bundle_id.attr,
@@ -82,14 +82,96 @@ static void gb_bundle_release(struct device *dev)
 {
 	struct gb_bundle *bundle = to_gb_bundle(dev);
 
+	trace_gb_bundle_release(bundle);
+
 	kfree(bundle->state);
 	kfree(bundle->cport_desc);
 	kfree(bundle);
 }
 
+#ifdef CONFIG_PM_RUNTIME
+
+static void gb_bundle_disable_all_connections(struct gb_bundle *bundle)
+{
+	struct gb_connection *connection;
+
+	list_for_each_entry(connection, &bundle->connections, bundle_links)
+		gb_connection_disable(connection);
+}
+
+static void gb_bundle_enable_all_connections(struct gb_bundle *bundle)
+{
+	struct gb_connection *connection;
+
+	list_for_each_entry(connection, &bundle->connections, bundle_links)
+		gb_connection_enable(connection);
+}
+
+static int gb_bundle_suspend(struct device *dev)
+{
+	struct gb_bundle *bundle = to_gb_bundle(dev);
+	const struct dev_pm_ops *pm = dev->driver->pm;
+	int ret;
+
+	if (pm && pm->runtime_suspend) {
+		ret = pm->runtime_suspend(&bundle->dev);
+		if (ret)
+			return ret;
+	} else {
+		gb_bundle_disable_all_connections(bundle);
+	}
+
+	ret = gb_control_bundle_suspend(bundle->intf->control, bundle->id);
+	if (ret) {
+		if (pm && pm->runtime_resume)
+			ret = pm->runtime_resume(dev);
+		else
+			gb_bundle_enable_all_connections(bundle);
+
+		return ret;
+	}
+
+	return 0;
+}
+
+static int gb_bundle_resume(struct device *dev)
+{
+	struct gb_bundle *bundle = to_gb_bundle(dev);
+	const struct dev_pm_ops *pm = dev->driver->pm;
+	int ret;
+
+	ret = gb_control_bundle_resume(bundle->intf->control, bundle->id);
+	if (ret)
+		return ret;
+
+	if (pm && pm->runtime_resume) {
+		ret = pm->runtime_resume(dev);
+		if (ret)
+			return ret;
+	} else {
+		gb_bundle_enable_all_connections(bundle);
+	}
+
+	return 0;
+}
+
+static int gb_bundle_idle(struct device *dev)
+{
+	pm_runtime_mark_last_busy(dev);
+	pm_request_autosuspend(dev);
+
+	return 0;
+}
+#endif
+
+static const struct dev_pm_ops gb_bundle_pm_ops = {
+	SET_RUNTIME_PM_OPS(gb_bundle_suspend, gb_bundle_resume, gb_bundle_idle)
+};
+
 struct device_type greybus_bundle_type = {
 	.name =		"greybus_bundle",
 	.release =	gb_bundle_release,
+	.pm =		&gb_bundle_pm_ops,
 };
 
 /*
@@ -101,6 +183,11 @@ struct gb_bundle *gb_bundle_create(struct gb_interface *intf, u8 bundle_id,
 				   u8 class)
 {
 	struct gb_bundle *bundle;
+
+	if (bundle_id == BUNDLE_ID_NONE) {
+		dev_err(&intf->dev, "can't use bundle id %u\n", bundle_id);
+		return NULL;
+	}
 
 	/*
 	 * Reject any attempt to reuse a bundle id.  We initialize
@@ -131,6 +218,8 @@ struct gb_bundle *gb_bundle_create(struct gb_interface *intf, u8 bundle_id,
 
 	list_add(&bundle->links, &intf->bundles);
 
+	trace_gb_bundle_create(bundle);
+
 	return bundle;
 }
 
@@ -144,6 +233,8 @@ int gb_bundle_add(struct gb_bundle *bundle)
 		return ret;
 	}
 
+	trace_gb_bundle_add(bundle);
+
 	return 0;
 }
 
@@ -152,6 +243,8 @@ int gb_bundle_add(struct gb_bundle *bundle)
  */
 void gb_bundle_destroy(struct gb_bundle *bundle)
 {
+	trace_gb_bundle_destroy(bundle);
+
 	if (device_is_registered(&bundle->dev))
 		device_del(&bundle->dev);
 

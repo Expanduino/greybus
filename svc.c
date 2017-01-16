@@ -8,15 +8,13 @@
  */
 
 #include <linux/debugfs.h>
-#include <linux/input.h>
 #include <linux/workqueue.h>
 
 #include "greybus.h"
 
-#define SVC_KEY_ARA_BUTTON	KEY_A
-
 #define SVC_INTF_EJECT_TIMEOUT		9000
 #define SVC_INTF_ACTIVATE_TIMEOUT	6000
+#define SVC_INTF_RESUME_TIMEOUT		3000
 
 struct gb_svc_deferred_request {
 	struct work_struct work;
@@ -43,7 +41,6 @@ static ssize_t ap_intf_id_show(struct device *dev,
 	return sprintf(buf, "%u\n", svc->ap_intf_id);
 }
 static DEVICE_ATTR_RO(ap_intf_id);
-
 
 // FIXME
 // This is a hack, we need to do this "right" and clean the interface up
@@ -103,6 +100,36 @@ static ssize_t watchdog_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(watchdog);
 
+static ssize_t watchdog_action_show(struct device *dev,
+				    struct device_attribute *attr, char *buf)
+{
+	struct gb_svc *svc = to_gb_svc(dev);
+
+	if (svc->action == GB_SVC_WATCHDOG_BITE_PANIC_KERNEL)
+		return sprintf(buf, "panic\n");
+	else if (svc->action == GB_SVC_WATCHDOG_BITE_RESET_UNIPRO)
+		return sprintf(buf, "reset\n");
+
+	return -EINVAL;
+}
+
+static ssize_t watchdog_action_store(struct device *dev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t len)
+{
+	struct gb_svc *svc = to_gb_svc(dev);
+
+	if (sysfs_streq(buf, "panic"))
+		svc->action = GB_SVC_WATCHDOG_BITE_PANIC_KERNEL;
+	else if (sysfs_streq(buf, "reset"))
+		svc->action = GB_SVC_WATCHDOG_BITE_RESET_UNIPRO;
+	else
+		return -EINVAL;
+
+	return len;
+}
+static DEVICE_ATTR_RW(watchdog_action);
+
 static int gb_svc_pwrmon_rail_count_get(struct gb_svc *svc, u8 *value)
 {
 	struct gb_svc_pwrmon_rail_count_get_response response;
@@ -133,6 +160,13 @@ static int gb_svc_pwrmon_rail_names_get(struct gb_svc *svc,
 	if (ret) {
 		dev_err(&svc->dev, "failed to get rail names: %d\n", ret);
 		return ret;
+	}
+
+	if (response->status != GB_SVC_OP_SUCCESS) {
+		dev_err(&svc->dev,
+			"SVC error while getting rail names: %u\n",
+			response->status);
+		return -EREMOTEIO;
 	}
 
 	return 0;
@@ -166,7 +200,7 @@ static int gb_svc_pwrmon_sample_get(struct gb_svc *svc, u8 rail_id,
 		case GB_SVC_PWRMON_GET_SAMPLE_NOSUPP:
 			return -ENOMSG;
 		default:
-			return -EIO;
+			return -EREMOTEIO;
 		}
 	}
 
@@ -202,9 +236,9 @@ int gb_svc_pwrmon_intf_sample_get(struct gb_svc *svc, u8 intf_id,
 		case GB_SVC_PWRMON_GET_SAMPLE_INVAL:
 			return -EINVAL;
 		case GB_SVC_PWRMON_GET_SAMPLE_NOSUPP:
-			return -ENOSYS;
+			return -ENOMSG;
 		default:
-			return -EIO;
+			return -EREMOTEIO;
 		}
 	}
 
@@ -218,6 +252,7 @@ static struct attribute *svc_attrs[] = {
 	&dev_attr_ap_intf_id.attr,
 	&dev_attr_intf_eject.attr,
 	&dev_attr_watchdog.attr,
+	&dev_attr_watchdog_action.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(svc);
@@ -340,8 +375,41 @@ int gb_svc_intf_activate(struct gb_svc *svc, u8 intf_id, u8 *intf_type)
 			SVC_INTF_ACTIVATE_TIMEOUT);
 	if (ret < 0)
 		return ret;
+	if (response.status != GB_SVC_OP_SUCCESS) {
+		dev_err(&svc->dev, "failed to activate interface %u: %u\n",
+				intf_id, response.status);
+		return -EREMOTEIO;
+	}
 
 	*intf_type = response.intf_type;
+
+	return 0;
+}
+
+int gb_svc_intf_resume(struct gb_svc *svc, u8 intf_id)
+{
+	struct gb_svc_intf_resume_request request;
+	struct gb_svc_intf_resume_response response;
+	int ret;
+
+	request.intf_id = intf_id;
+
+	ret = gb_operation_sync_timeout(svc->connection,
+					GB_SVC_TYPE_INTF_RESUME,
+					&request, sizeof(request),
+					&response, sizeof(response),
+					SVC_INTF_RESUME_TIMEOUT);
+	if (ret < 0) {
+		dev_err(&svc->dev, "failed to send interface resume %u: %d\n",
+			intf_id, ret);
+		return ret;
+	}
+
+	if (response.status != GB_SVC_OP_SUCCESS) {
+		dev_err(&svc->dev, "failed to resume interface %u: %u\n",
+			intf_id, response.status);
+		return -EREMOTEIO;
+	}
 
 	return 0;
 }
@@ -371,7 +439,7 @@ int gb_svc_dme_peer_get(struct gb_svc *svc, u8 intf_id, u16 attr, u16 selector,
 	if (result) {
 		dev_err(&svc->dev, "UniPro error while getting DME attribute (%u 0x%04x %u): %u\n",
 				intf_id, attr, selector, result);
-		return -EIO;
+		return -EREMOTEIO;
 	}
 
 	if (value)
@@ -379,7 +447,6 @@ int gb_svc_dme_peer_get(struct gb_svc *svc, u8 intf_id, u16 attr, u16 selector,
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(gb_svc_dme_peer_get);
 
 int gb_svc_dme_peer_set(struct gb_svc *svc, u8 intf_id, u16 attr, u16 selector,
 			u32 value)
@@ -407,12 +474,11 @@ int gb_svc_dme_peer_set(struct gb_svc *svc, u8 intf_id, u16 attr, u16 selector,
 	if (result) {
 		dev_err(&svc->dev, "UniPro error while setting DME attribute (%u 0x%04x %u %u): %u\n",
 				intf_id, attr, selector, value, result);
-		return -EIO;
+		return -EREMOTEIO;
 	}
 
 	return 0;
 }
-EXPORT_SYMBOL_GPL(gb_svc_dme_peer_set);
 
 int gb_svc_connection_create(struct gb_svc *svc,
 				u8 intf1_id, u16 cport1_id,
@@ -431,7 +497,6 @@ int gb_svc_connection_create(struct gb_svc *svc,
 	return gb_operation_sync(svc->connection, GB_SVC_TYPE_CONN_CREATE,
 				 &request, sizeof(request), NULL, 0);
 }
-EXPORT_SYMBOL_GPL(gb_svc_connection_create);
 
 void gb_svc_connection_destroy(struct gb_svc *svc, u8 intf1_id, u16 cport1_id,
 			       u8 intf2_id, u16 cport2_id)
@@ -452,7 +517,85 @@ void gb_svc_connection_destroy(struct gb_svc *svc, u8 intf1_id, u16 cport1_id,
 				intf1_id, cport1_id, intf2_id, cport2_id, ret);
 	}
 }
-EXPORT_SYMBOL_GPL(gb_svc_connection_destroy);
+
+int gb_svc_timesync_enable(struct gb_svc *svc, u8 count, u64 frame_time,
+			   u32 strobe_delay, u32 refclk)
+{
+	struct gb_connection *connection = svc->connection;
+	struct gb_svc_timesync_enable_request request;
+
+	request.count = count;
+	request.frame_time = cpu_to_le64(frame_time);
+	request.strobe_delay = cpu_to_le32(strobe_delay);
+	request.refclk = cpu_to_le32(refclk);
+	return gb_operation_sync(connection,
+				 GB_SVC_TYPE_TIMESYNC_ENABLE,
+				 &request, sizeof(request), NULL, 0);
+}
+
+int gb_svc_timesync_disable(struct gb_svc *svc)
+{
+	struct gb_connection *connection = svc->connection;
+
+	return gb_operation_sync(connection,
+				 GB_SVC_TYPE_TIMESYNC_DISABLE,
+				 NULL, 0, NULL, 0);
+}
+
+int gb_svc_timesync_authoritative(struct gb_svc *svc, u64 *frame_time)
+{
+	struct gb_connection *connection = svc->connection;
+	struct gb_svc_timesync_authoritative_response response;
+	int ret, i;
+
+	ret = gb_operation_sync(connection,
+				GB_SVC_TYPE_TIMESYNC_AUTHORITATIVE, NULL, 0,
+				&response, sizeof(response));
+	if (ret < 0)
+		return ret;
+
+	for (i = 0; i < GB_TIMESYNC_MAX_STROBES; i++)
+		frame_time[i] = le64_to_cpu(response.frame_time[i]);
+	return 0;
+}
+
+int gb_svc_timesync_ping(struct gb_svc *svc, u64 *frame_time)
+{
+	struct gb_connection *connection = svc->connection;
+	struct gb_svc_timesync_ping_response response;
+	int ret;
+
+	ret = gb_operation_sync(connection,
+				GB_SVC_TYPE_TIMESYNC_PING,
+				NULL, 0,
+				&response, sizeof(response));
+	if (ret < 0)
+		return ret;
+
+	*frame_time = le64_to_cpu(response.frame_time);
+	return 0;
+}
+
+int gb_svc_timesync_wake_pins_acquire(struct gb_svc *svc, u32 strobe_mask)
+{
+	struct gb_connection *connection = svc->connection;
+	struct gb_svc_timesync_wake_pins_acquire_request request;
+
+	request.strobe_mask = cpu_to_le32(strobe_mask);
+	return gb_operation_sync(connection,
+				 GB_SVC_TYPE_TIMESYNC_WAKE_PINS_ACQUIRE,
+				 &request, sizeof(request),
+				 NULL, 0);
+}
+
+int gb_svc_timesync_wake_pins_release(struct gb_svc *svc)
+{
+	struct gb_connection *connection = svc->connection;
+
+	return gb_operation_sync(connection,
+				 GB_SVC_TYPE_TIMESYNC_WAKE_PINS_RELEASE,
+				 NULL, 0, NULL, 0);
+}
 
 /* Creates bi-directional routes between the devices */
 int gb_svc_route_create(struct gb_svc *svc, u8 intf1_id, u8 dev1_id,
@@ -488,23 +631,35 @@ void gb_svc_route_destroy(struct gb_svc *svc, u8 intf1_id, u8 intf2_id)
 
 int gb_svc_intf_set_power_mode(struct gb_svc *svc, u8 intf_id, u8 hs_series,
 			       u8 tx_mode, u8 tx_gear, u8 tx_nlanes,
+			       u8 tx_amplitude, u8 tx_hs_equalizer,
 			       u8 rx_mode, u8 rx_gear, u8 rx_nlanes,
-			       u8 flags, u32 quirks)
+			       u8 flags, u32 quirks,
+			       struct gb_svc_l2_timer_cfg *local,
+			       struct gb_svc_l2_timer_cfg *remote)
 {
 	struct gb_svc_intf_set_pwrm_request request;
 	struct gb_svc_intf_set_pwrm_response response;
 	int ret;
+	u16 result_code;
+
+	memset(&request, 0, sizeof(request));
 
 	request.intf_id = intf_id;
 	request.hs_series = hs_series;
 	request.tx_mode = tx_mode;
 	request.tx_gear = tx_gear;
 	request.tx_nlanes = tx_nlanes;
+	request.tx_amplitude = tx_amplitude;
+	request.tx_hs_equalizer = tx_hs_equalizer;
 	request.rx_mode = rx_mode;
 	request.rx_gear = rx_gear;
 	request.rx_nlanes = rx_nlanes;
 	request.flags = flags;
 	request.quirks = cpu_to_le32(quirks);
+	if (local)
+		request.local_l2timerdata = *local;
+	if (remote)
+		request.remote_l2timerdata = *remote;
 
 	ret = gb_operation_sync(svc->connection, GB_SVC_TYPE_INTF_SET_PWRM,
 				&request, sizeof(request),
@@ -512,9 +667,50 @@ int gb_svc_intf_set_power_mode(struct gb_svc *svc, u8 intf_id, u8 hs_series,
 	if (ret < 0)
 		return ret;
 
-	return le16_to_cpu(response.result_code);
+	result_code = response.result_code;
+	if (result_code != GB_SVC_SETPWRM_PWR_LOCAL) {
+		dev_err(&svc->dev, "set power mode = %d\n", result_code);
+		return -EIO;
+	}
+
+	return 0;
 }
 EXPORT_SYMBOL_GPL(gb_svc_intf_set_power_mode);
+
+int gb_svc_intf_set_power_mode_hibernate(struct gb_svc *svc, u8 intf_id)
+{
+	struct gb_svc_intf_set_pwrm_request request;
+	struct gb_svc_intf_set_pwrm_response response;
+	int ret;
+	u16 result_code;
+
+	memset(&request, 0, sizeof(request));
+
+	request.intf_id = intf_id;
+	request.hs_series = GB_SVC_UNIPRO_HS_SERIES_A;
+	request.tx_mode = GB_SVC_UNIPRO_HIBERNATE_MODE;
+	request.rx_mode = GB_SVC_UNIPRO_HIBERNATE_MODE;
+
+	ret = gb_operation_sync(svc->connection, GB_SVC_TYPE_INTF_SET_PWRM,
+				&request, sizeof(request),
+				&response, sizeof(response));
+	if (ret < 0) {
+		dev_err(&svc->dev,
+			"failed to send set power mode operation to interface %u: %d\n",
+			intf_id, ret);
+		return ret;
+	}
+
+	result_code = response.result_code;
+	if (result_code != GB_SVC_SETPWRM_PWR_OK) {
+		dev_err(&svc->dev,
+			"failed to hibernate the link for interface %u: %u\n",
+			intf_id, result_code);
+		return -EIO;
+	}
+
+	return 0;
+}
 
 int gb_svc_ping(struct gb_svc *svc)
 {
@@ -522,7 +718,6 @@ int gb_svc_ping(struct gb_svc *svc)
 					 NULL, 0, NULL, 0,
 					 GB_OPERATION_TIMEOUT_DEFAULT * 2);
 }
-EXPORT_SYMBOL_GPL(gb_svc_ping);
 
 static int gb_svc_version_request(struct gb_operation *op)
 {
@@ -657,7 +852,8 @@ static void gb_svc_pwrmon_debugfs_init(struct gb_svc *svc)
 	if (!rail_count || rail_count > GB_SVC_PWRMON_MAX_RAIL_COUNT)
 		goto err_pwrmon_debugfs;
 
-	bufsize = GB_SVC_PWRMON_RAIL_NAME_BUFSIZE * rail_count;
+	bufsize = sizeof(*rail_names) +
+		GB_SVC_PWRMON_RAIL_NAME_BUFSIZE * rail_count;
 
 	rail_names = kzalloc(bufsize, GFP_KERNEL);
 	if (!rail_names)
@@ -689,7 +885,7 @@ static void gb_svc_pwrmon_debugfs_init(struct gb_svc *svc)
 				    &pwrmon_debugfs_current_fops);
 		debugfs_create_file("power_now", S_IRUGO, dir, rail,
 				    &pwrmon_debugfs_power_fops);
-	};
+	}
 
 	kfree(rail_names);
 	return;
@@ -741,24 +937,27 @@ static int gb_svc_hello(struct gb_operation *op)
 		return ret;
 	}
 
-	ret = input_register_device(svc->input);
-	if (ret) {
-		dev_err(&svc->dev, "failed to register input: %d\n", ret);
-		device_del(&svc->dev);
-		return ret;
-	}
-
 	ret = gb_svc_watchdog_create(svc);
 	if (ret) {
 		dev_err(&svc->dev, "failed to create watchdog: %d\n", ret);
-		input_unregister_device(svc->input);
-		device_del(&svc->dev);
-		return ret;
+		goto err_unregister_device;
 	}
 
 	gb_svc_debugfs_init(svc);
 
+	ret = gb_timesync_svc_add(svc);
+	if (ret) {
+		dev_err(&svc->dev, "failed to add SVC to timesync: %d\n", ret);
+		gb_svc_debugfs_exit(svc);
+		goto err_unregister_device;
+	}
+
 	return gb_svc_queue_deferred_request(op);
+
+err_unregister_device:
+	gb_svc_watchdog_destroy(svc);
+	device_del(&svc->dev);
+	return ret;
 }
 
 static struct gb_interface *gb_svc_interface_lookup(struct gb_svc *svc,
@@ -795,28 +994,6 @@ static struct gb_module *gb_svc_module_lookup(struct gb_svc *svc, u8 module_id)
 	return NULL;
 }
 
-static void gb_svc_intf_reenable(struct gb_svc *svc, struct gb_interface *intf)
-{
-	int ret;
-
-	mutex_lock(&intf->mutex);
-
-	/* Mark as disconnected to prevent I/O during disable. */
-	intf->disconnected = true;
-	gb_interface_disable(intf);
-	intf->disconnected = false;
-
-	ret = gb_interface_enable(intf);
-	if (ret) {
-		dev_err(&svc->dev, "failed to enable interface %u: %d\n",
-				intf->interface_id, ret);
-
-		gb_interface_deactivate(intf);
-	}
-
-	mutex_unlock(&intf->mutex);
-}
-
 static void gb_svc_process_hello_deferred(struct gb_operation *operation)
 {
 	struct gb_connection *connection = operation->connection;
@@ -836,82 +1013,16 @@ static void gb_svc_process_hello_deferred(struct gb_operation *operation)
 					GB_SVC_UNIPRO_HS_SERIES_A,
 					GB_SVC_UNIPRO_SLOW_AUTO_MODE,
 					2, 1,
+					GB_SVC_SMALL_AMPLITUDE, GB_SVC_NO_DE_EMPHASIS,
 					GB_SVC_UNIPRO_SLOW_AUTO_MODE,
 					2, 1,
-					0, 0);
+					0, 0,
+					NULL, NULL);
 
 	if (ret)
 		dev_warn(&svc->dev,
 			"power mode change failed on AP to switch link: %d\n",
 			ret);
-}
-
-static void gb_svc_process_intf_hotplug(struct gb_operation *operation)
-{
-	struct gb_svc_intf_hotplug_request *request;
-	struct gb_connection *connection = operation->connection;
-	struct gb_svc *svc = gb_connection_get_data(connection);
-	struct gb_host_device *hd = connection->hd;
-	struct gb_module *module;
-	u8 intf_id;
-	int ret;
-
-	/* The request message size has already been verified. */
-	request = operation->request->payload;
-	intf_id = request->intf_id;
-
-	dev_dbg(&svc->dev, "%s - id = %u\n", __func__, intf_id);
-
-	/* All modules are considered 1x2 for now */
-	module = gb_svc_module_lookup(svc, intf_id);
-	if (module) {
-		dev_info(&svc->dev, "mode switch detected on interface %u\n",
-				intf_id);
-
-		return gb_svc_intf_reenable(svc, module->interfaces[0]);
-	}
-
-	module = gb_module_create(hd, intf_id, 1);
-	if (!module) {
-		dev_err(&svc->dev, "failed to create module\n");
-		return;
-	}
-
-	ret = gb_module_add(module);
-	if (ret) {
-		gb_module_put(module);
-		return;
-	}
-
-	list_add(&module->hd_node, &hd->modules);
-}
-
-static void gb_svc_process_intf_hot_unplug(struct gb_operation *operation)
-{
-	struct gb_svc *svc = gb_connection_get_data(operation->connection);
-	struct gb_svc_intf_hot_unplug_request *request;
-	struct gb_module *module;
-	u8 intf_id;
-
-	/* The request message size has already been verified. */
-	request = operation->request->payload;
-	intf_id = request->intf_id;
-
-	dev_dbg(&svc->dev, "%s - id = %u\n", __func__, intf_id);
-
-	/* All modules are considered 1x2 for now */
-	module = gb_svc_module_lookup(svc, intf_id);
-	if (!module) {
-		dev_warn(&svc->dev, "could not find hot-unplug interface %u\n",
-				intf_id);
-		return;
-	}
-
-	module->disconnected = true;
-
-	gb_module_del(module);
-	list_del(&module->hd_node);
-	gb_module_put(module);
 }
 
 static void gb_svc_process_module_inserted(struct gb_operation *operation)
@@ -990,6 +1101,37 @@ static void gb_svc_process_module_removed(struct gb_operation *operation)
 	gb_module_put(module);
 }
 
+static void gb_svc_process_intf_oops(struct gb_operation *operation)
+{
+	struct gb_svc_intf_oops_request *request;
+	struct gb_connection *connection = operation->connection;
+	struct gb_svc *svc = gb_connection_get_data(connection);
+	struct gb_interface *intf;
+	u8 intf_id;
+	u8 reason;
+
+	/* The request message size has already been verified. */
+	request = operation->request->payload;
+	intf_id = request->intf_id;
+	reason = request->reason;
+
+	intf = gb_svc_interface_lookup(svc, intf_id);
+	if (!intf) {
+		dev_warn(&svc->dev, "unexpected interface-oops event %u\n",
+			 intf_id);
+		return;
+	}
+
+	dev_info(&svc->dev, "Deactivating interface %u, interface oops reason = %u\n",
+		 intf_id, reason);
+
+	mutex_lock(&intf->mutex);
+	intf->disconnected = true;
+	gb_interface_disable(intf);
+	gb_interface_deactivate(intf);
+	mutex_unlock(&intf->mutex);
+}
+
 static void gb_svc_process_intf_mailbox_event(struct gb_operation *operation)
 {
 	struct gb_svc_intf_mailbox_event_request *request;
@@ -1015,31 +1157,7 @@ static void gb_svc_process_intf_mailbox_event(struct gb_operation *operation)
 		return;
 	}
 
-	if (result_code) {
-		dev_warn(&svc->dev,
-				"mailbox event %u with UniPro error: 0x%04x\n",
-				intf_id, result_code);
-		goto err_disable_interface;
-	}
-
-	if (mailbox != GB_SVC_INTF_MAILBOX_GREYBUS) {
-		dev_warn(&svc->dev,
-				"mailbox event %u with unexected value: 0x%08x\n",
-				intf_id, mailbox);
-		goto err_disable_interface;
-	}
-
-	dev_info(&svc->dev, "mode switch detected on interface %u\n", intf_id);
-
-	gb_svc_intf_reenable(svc, intf);
-
-	return;
-
-err_disable_interface:
-	mutex_lock(&intf->mutex);
-	gb_interface_disable(intf);
-	gb_interface_deactivate(intf);
-	mutex_unlock(&intf->mutex);
+	gb_interface_mailbox_event(intf, result_code, mailbox);
 }
 
 static void gb_svc_process_deferred_request(struct work_struct *work)
@@ -1058,12 +1176,6 @@ static void gb_svc_process_deferred_request(struct work_struct *work)
 	case GB_SVC_TYPE_SVC_HELLO:
 		gb_svc_process_hello_deferred(operation);
 		break;
-	case GB_SVC_TYPE_INTF_HOTPLUG:
-		gb_svc_process_intf_hotplug(operation);
-		break;
-	case GB_SVC_TYPE_INTF_HOT_UNPLUG:
-		gb_svc_process_intf_hot_unplug(operation);
-		break;
 	case GB_SVC_TYPE_MODULE_INSERTED:
 		gb_svc_process_module_inserted(operation);
 		break;
@@ -1072,6 +1184,9 @@ static void gb_svc_process_deferred_request(struct work_struct *work)
 		break;
 	case GB_SVC_TYPE_INTF_MAILBOX_EVENT:
 		gb_svc_process_intf_mailbox_event(operation);
+		break;
+	case GB_SVC_TYPE_INTF_OOPS:
+		gb_svc_process_intf_oops(operation);
 		break;
 	default:
 		dev_err(&svc->dev, "bad deferred request type: 0x%02x\n", type);
@@ -1100,51 +1215,6 @@ static int gb_svc_queue_deferred_request(struct gb_operation *operation)
 	return 0;
 }
 
-/*
- * Bringing up a module can be time consuming, as that may require lots of
- * initialization on the module side. Over that, we may also need to download
- * the firmware first and flash that on the module.
- *
- * In order not to make other svc events wait for all this to finish,
- * handle most of module hotplug stuff outside of the hotplug callback, with
- * help of a workqueue.
- */
-static int gb_svc_intf_hotplug_recv(struct gb_operation *op)
-{
-	struct gb_svc *svc = gb_connection_get_data(op->connection);
-	struct gb_svc_intf_hotplug_request *request;
-
-	if (op->request->payload_size < sizeof(*request)) {
-		dev_warn(&svc->dev, "short hotplug request received (%zu < %zu)\n",
-				op->request->payload_size, sizeof(*request));
-		return -EINVAL;
-	}
-
-	request = op->request->payload;
-
-	dev_dbg(&svc->dev, "%s - id = %u\n", __func__, request->intf_id);
-
-	return gb_svc_queue_deferred_request(op);
-}
-
-static int gb_svc_intf_hot_unplug_recv(struct gb_operation *op)
-{
-	struct gb_svc *svc = gb_connection_get_data(op->connection);
-	struct gb_svc_intf_hot_unplug_request *request;
-
-	if (op->request->payload_size < sizeof(*request)) {
-		dev_warn(&svc->dev, "short hot unplug request received (%zu < %zu)\n",
-				op->request->payload_size, sizeof(*request));
-		return -EINVAL;
-	}
-
-	request = op->request->payload;
-
-	dev_dbg(&svc->dev, "%s - id = %u\n", __func__, request->intf_id);
-
-	return gb_svc_queue_deferred_request(op);
-}
-
 static int gb_svc_intf_reset_recv(struct gb_operation *op)
 {
 	struct gb_svc *svc = gb_connection_get_data(op->connection);
@@ -1162,53 +1232,6 @@ static int gb_svc_intf_reset_recv(struct gb_operation *op)
 	intf_id = reset->intf_id;
 
 	/* FIXME Reset the interface here */
-
-	return 0;
-}
-
-static int gb_svc_key_code_map(struct gb_svc *svc, u16 key_code, u16 *code)
-{
-	switch (key_code) {
-	case GB_KEYCODE_ARA:
-		*code = SVC_KEY_ARA_BUTTON;
-		break;
-	default:
-		dev_warn(&svc->dev, "unknown keycode received: %u\n", key_code);
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-static int gb_svc_key_event_recv(struct gb_operation *op)
-{
-	struct gb_svc *svc = gb_connection_get_data(op->connection);
-	struct gb_message *request = op->request;
-	struct gb_svc_key_event_request *key;
-	u16 code;
-	u8 event;
-	int ret;
-
-	if (request->payload_size < sizeof(*key)) {
-		dev_warn(&svc->dev, "short key request received (%zu < %zu)\n",
-			 request->payload_size, sizeof(*key));
-		return -EINVAL;
-	}
-
-	key = request->payload;
-
-	ret = gb_svc_key_code_map(svc, le16_to_cpu(key->key_code), &code);
-	if (ret < 0)
-		return ret;
-
-	event = key->key_event;
-	if ((event != GB_SVC_KEY_PRESSED) && (event != GB_SVC_KEY_RELEASED)) {
-		dev_warn(&svc->dev, "unknown key event received: %u\n", event);
-		return -EINVAL;
-	}
-
-	input_report_key(svc->input, code, (event == GB_SVC_KEY_PRESSED));
-	input_sync(svc->input);
 
 	return 0;
 }
@@ -1247,6 +1270,20 @@ static int gb_svc_module_removed_recv(struct gb_operation *op)
 
 	dev_dbg(&svc->dev, "%s - id = %u\n", __func__,
 			request->primary_intf_id);
+
+	return gb_svc_queue_deferred_request(op);
+}
+
+static int gb_svc_intf_oops_recv(struct gb_operation *op)
+{
+	struct gb_svc *svc = gb_connection_get_data(op->connection);
+	struct gb_svc_intf_oops_request *request;
+
+	if (op->request->payload_size < sizeof(*request)) {
+		dev_warn(&svc->dev, "short intf-oops request received (%zu < %zu)\n",
+			 op->request->payload_size, sizeof(*request));
+		return -EINVAL;
+	}
 
 	return gb_svc_queue_deferred_request(op);
 }
@@ -1318,52 +1355,20 @@ static int gb_svc_request_handler(struct gb_operation *op)
 		if (!ret)
 			svc->state = GB_SVC_STATE_SVC_HELLO;
 		return ret;
-	case GB_SVC_TYPE_INTF_HOTPLUG:
-		return gb_svc_intf_hotplug_recv(op);
-	case GB_SVC_TYPE_INTF_HOT_UNPLUG:
-		return gb_svc_intf_hot_unplug_recv(op);
 	case GB_SVC_TYPE_INTF_RESET:
 		return gb_svc_intf_reset_recv(op);
-	case GB_SVC_TYPE_KEY_EVENT:
-		return gb_svc_key_event_recv(op);
 	case GB_SVC_TYPE_MODULE_INSERTED:
 		return gb_svc_module_inserted_recv(op);
 	case GB_SVC_TYPE_MODULE_REMOVED:
 		return gb_svc_module_removed_recv(op);
 	case GB_SVC_TYPE_INTF_MAILBOX_EVENT:
 		return gb_svc_intf_mailbox_event_recv(op);
+	case GB_SVC_TYPE_INTF_OOPS:
+		return gb_svc_intf_oops_recv(op);
 	default:
 		dev_warn(&svc->dev, "unsupported request 0x%02x\n", type);
 		return -EINVAL;
 	}
-}
-
-static struct input_dev *gb_svc_input_create(struct gb_svc *svc)
-{
-	struct input_dev *input_dev;
-
-	input_dev = input_allocate_device();
-	if (!input_dev)
-		return ERR_PTR(-ENOMEM);
-
-	input_dev->name = dev_name(&svc->dev);
-	svc->input_phys = kasprintf(GFP_KERNEL, "greybus-%s/input0",
-				    input_dev->name);
-	if (!svc->input_phys)
-		goto err_free_input;
-
-	input_dev->phys = svc->input_phys;
-	input_dev->dev.parent = &svc->dev;
-
-	input_set_drvdata(input_dev, svc);
-
-	input_set_capability(input_dev, EV_KEY, SVC_KEY_ARA_BUTTON);
-
-	return input_dev;
-
-err_free_input:
-	input_free_device(svc->input);
-	return ERR_PTR(-ENOMEM);
 }
 
 static void gb_svc_release(struct device *dev)
@@ -1374,7 +1379,6 @@ static void gb_svc_release(struct device *dev)
 		gb_connection_destroy(svc->connection);
 	ida_destroy(&svc->device_id_map);
 	destroy_workqueue(svc->wq);
-	kfree(svc->input_phys);
 	kfree(svc);
 }
 
@@ -1410,27 +1414,18 @@ struct gb_svc *gb_svc_create(struct gb_host_device *hd)
 	svc->state = GB_SVC_STATE_RESET;
 	svc->hd = hd;
 
-	svc->input = gb_svc_input_create(svc);
-	if (IS_ERR(svc->input)) {
-		dev_err(&svc->dev, "failed to create input device: %ld\n",
-			PTR_ERR(svc->input));
-		goto err_put_device;
-	}
-
 	svc->connection = gb_connection_create_static(hd, GB_SVC_CPORT_ID,
 						gb_svc_request_handler);
 	if (IS_ERR(svc->connection)) {
 		dev_err(&svc->dev, "failed to create connection: %ld\n",
 				PTR_ERR(svc->connection));
-		goto err_free_input;
+		goto err_put_device;
 	}
 
 	gb_connection_set_data(svc->connection, svc);
 
 	return svc;
 
-err_free_input:
-	input_free_device(svc->input);
 err_put_device:
 	put_device(&svc->dev);
 	return NULL;
@@ -1466,22 +1461,23 @@ static void gb_svc_remove_modules(struct gb_svc *svc)
 
 void gb_svc_del(struct gb_svc *svc)
 {
-	gb_connection_disable(svc->connection);
+	gb_connection_disable_rx(svc->connection);
 
 	/*
-	 * The SVC device and input device may have been registered
-	 * from the request handler.
+	 * The SVC device may have been registered from the request handler.
 	 */
 	if (device_is_registered(&svc->dev)) {
+		gb_timesync_svc_remove(svc);
 		gb_svc_debugfs_exit(svc);
 		gb_svc_watchdog_destroy(svc);
-		input_unregister_device(svc->input);
 		device_del(&svc->dev);
 	}
 
 	flush_workqueue(svc->wq);
 
 	gb_svc_remove_modules(svc);
+
+	gb_connection_disable(svc->connection);
 }
 
 void gb_svc_put(struct gb_svc *svc)

@@ -33,11 +33,16 @@ int gb_audio_apbridgea_register_cport(struct gb_connection *connection,
 				      __u8 direction)
 {
 	struct audio_apbridgea_register_cport_request req;
+	int ret;
 
 	req.hdr.type = AUDIO_APBRIDGEA_TYPE_REGISTER_CPORT;
 	req.hdr.i2s_port = cpu_to_le16(i2s_port);
 	req.cport = cpu_to_le16(cportid);
 	req.direction = direction;
+
+	ret = gb_pm_runtime_get_sync(connection->bundle);
+	if (ret)
+		return ret;
 
 	return gb_hd_output(connection->hd, &req, sizeof(req),
 			    GB_APB_REQUEST_AUDIO_CONTROL, true);
@@ -49,14 +54,19 @@ int gb_audio_apbridgea_unregister_cport(struct gb_connection *connection,
 					__u8 direction)
 {
 	struct audio_apbridgea_unregister_cport_request req;
+	int ret;
 
 	req.hdr.type = AUDIO_APBRIDGEA_TYPE_UNREGISTER_CPORT;
 	req.hdr.i2s_port = cpu_to_le16(i2s_port);
 	req.cport = cpu_to_le16(cportid);
 	req.direction = direction;
 
-	return gb_hd_output(connection->hd, &req, sizeof(req),
-			    GB_APB_REQUEST_AUDIO_CONTROL, true);
+	ret = gb_hd_output(connection->hd, &req, sizeof(req),
+			   GB_APB_REQUEST_AUDIO_CONTROL, true);
+
+	gb_pm_runtime_put_autosuspend(connection->bundle);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(gb_audio_apbridgea_unregister_cport);
 
@@ -73,14 +83,6 @@ int gb_audio_apbridgea_set_tx_data_size(struct gb_connection *connection,
 			    GB_APB_REQUEST_AUDIO_CONTROL, true);
 }
 EXPORT_SYMBOL_GPL(gb_audio_apbridgea_set_tx_data_size);
-
-int gb_audio_apbridgea_get_tx_delay(struct gb_connection *connection,
-				    __u16 i2s_port, __u32 *delay)
-{
-	/* TODO: implement */
-	return -ENOSYS;
-}
-EXPORT_SYMBOL_GPL(gb_audio_apbridgea_get_tx_delay);
 
 int gb_audio_apbridgea_prepare_tx(struct gb_connection *connection,
 				  __u16 i2s_port)
@@ -147,14 +149,6 @@ int gb_audio_apbridgea_set_rx_data_size(struct gb_connection *connection,
 			    GB_APB_REQUEST_AUDIO_CONTROL, true);
 }
 EXPORT_SYMBOL_GPL(gb_audio_apbridgea_set_rx_data_size);
-
-int gb_audio_apbridgea_get_rx_delay(struct gb_connection *connection,
-				    __u16 i2s_port, __u32 *delay)
-{
-	/* TODO: implement */
-	return -ENOSYS;
-}
-EXPORT_SYMBOL_GPL(gb_audio_apbridgea_get_rx_delay);
 
 int gb_audio_apbridgea_prepare_rx(struct gb_connection *connection,
 				  __u16 i2s_port)
